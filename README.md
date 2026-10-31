@@ -286,7 +286,7 @@ node read-aloud.mjs widget ctx.txt --out button.html
 真 PowerShell 实跑（不真出声，落盘验时长）：
 
 ```bash
-# ① 造一个 21 字的单句（只有一块 → 走单元素数组那条路）
+# ① 造一个 18 字的单句（只有一块 → 走单元素数组那条路）
 #    路径必须写绝对 Windows 路径：Git Bash 里 $TEMP 是 /tmp（MSYS 路径），会被改写
 printf '【用户】这是一句用于验收的中文朗读测试文本。\n' > "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.txt"
 # ② 真实 PS7 合成到 wav（只落盘不播音）
