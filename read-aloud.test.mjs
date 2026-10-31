@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
+  buildSapiScript,
   buildSpeechChunks,
   buildSpeakPlan,
   buildWidgetFragment,
@@ -145,6 +146,23 @@ const FIXTURE_MESSAGES = [
     {},
     [["p11a", 0, { type: "text", text: "部件级运行时消息，不应入朗读。", metadata: { runtimeMessage: { source: "environment" } } }]],
   ],
+  // 宿主注入的合成块（role=user/type=text，但带合成标记）：真实用户消息长这样，
+  // 指纹匹配必须把它们排除，否则会出现伪多命中，甚至「唯一命中且静默取错会话」。
+  ["m12", 11, "user", { synthetic: true }, [["p12a", 0, { type: "text", text: "宿主合成注入指纹甲。" }]]],
+  [
+    "m13",
+    12,
+    "user",
+    {},
+    [["p13a", 0, { type: "text", text: "宿主部件注入指纹乙。", metadata: { visibility: "model-only" } }]],
+  ],
+  [
+    "m14",
+    13,
+    "user",
+    {},
+    [["p14a", 0, { type: "text", text: "宿主运行时注入指纹丙。", metadata: { runtimeMessage: { source: "tool_search_announcement" } } }]],
+  ],
 ];
 
 let fixtureCounter = 0;
@@ -170,6 +188,8 @@ async function createFixtureDb() {
   // 两个都含同一段指纹文本的主会话：用来钉死「多命中必须报错并列候选」，绝不静默取第一个
   insertSession.run("sess_dup_a", "重复指纹会话甲", 2500, null);
   insertSession.run("sess_dup_b", "重复指纹会话乙", 2400, null);
+  // 更旧的主会话（用户消息）：证明指纹搜索会扫到候选集里的较早会话，不只扫最新那个
+  insertSession.run("sess_older_user", "较早的用户消息会话", 1500, null);
 
   const insertMessage = db.prepare("INSERT INTO message (id, session_id, data, sequence) VALUES (?, ?, ?, ?)");
   const insertPart = db.prepare("INSERT INTO part (id, message_id, session_id, data, sequence) VALUES (?, ?, ?, ?, ?)");
@@ -205,6 +225,15 @@ async function createFixtureDb() {
     "dup_msg_reasoning",
     "sess_dup_a",
     JSON.stringify({ type: "reasoning", text: "共享指纹文本，用于多命中测试。" }),
+    0
+  );
+  // 更旧会话里的真实用户消息：证明搜索覆盖候选集里的较早会话
+  insertMessage.run("older_msg", "sess_older_user", JSON.stringify({ role: "user" }), 0);
+  insertPart.run(
+    "older_part",
+    "older_msg",
+    "sess_older_user",
+    JSON.stringify({ type: "text", text: "较早会话的用户消息指纹。" }),
     0
   );
   } catch (err) {
@@ -401,10 +430,21 @@ test("dump：--session-by-text 唯一命中选中正确会话（且与 --session
     const hits = findSessionsByText(db, "第一轮提问。", 10);
     assert.equal(hits.length, 1, "指纹应只命中 sess_main");
     assert.equal(hits[0].id, "sess_main");
-    // 指纹命中不等于「最近更新的会话」：sess_consecutive 更旧也必须能被搜到
-    const older = findSessionsByText(db, "连续助手消息3。", 10);
+    // 指纹命中不等于「最近更新的会话」：更旧会话里的真实用户消息也必须能被搜到
+    const older = findSessionsByText(db, "较早会话的用户消息指纹。", 10);
     assert.equal(older.length, 1);
-    assert.equal(older[0].id, "sess_consecutive");
+    assert.equal(older[0].id, "sess_older_user");
+    // 命中判定必须是「真实用户消息」：助手消息不算命中
+    assert.equal(findSessionsByText(db, "连续助手消息3。", 10).length, 0, "助手消息不参与匹配");
+    // 宿主注入的合成块（role=user/type=text 但带合成标记）不参与匹配：
+    // 不滤会伪多命中；更危险的是「唯一命中且静默取错会话」。
+    assert.equal(findSessionsByText(db, "宿主合成注入指纹甲。", 10).length, 0, "消息级合成注入不参与匹配");
+    assert.equal(findSessionsByText(db, "宿主部件注入指纹乙。", 10).length, 0, "part 级 model-only 不参与匹配");
+    assert.equal(
+      findSessionsByText(db, "宿主运行时注入指纹丙。", 10).length,
+      0,
+      "part 级 runtimeMessage 不参与匹配"
+    );
   } finally {
     db.close();
   }
@@ -426,16 +466,27 @@ test("dump：--session-by-text 唯一命中选中正确会话（且与 --session
   assert.match(both.stderr, /互斥/);
 });
 
-test("dump：--session-by-text 零命中报错（指纹未命中任何会话）", async () => {
+test("dump：--session-by-text 零命中报错（指纹未命中任何会话，含合成注入文本）", async () => {
   const dbPath = await createFixtureDb();
-  const cli = spawnSync(
-    process.execPath,
-    [CLI, "dump", "--db", dbPath, "--session-by-text", "绝对不会出现在任何会话里的指纹串"],
-    { encoding: "utf8" }
-  );
-  assert.notEqual(cli.status, 0, "零命中必须非 0 退出");
-  assert.match(cli.stderr, /指纹未命中任何会话/);
-  assert.equal(cli.stdout.trim(), "", "零命中不得输出正文");
+  for (const fingerprint of ["绝对不会出现在任何会话里的指纹串", "宿主合成注入指纹甲。"]) {
+    const cli = spawnSync(process.execPath, [CLI, "dump", "--db", dbPath, "--session-by-text", fingerprint], {
+      encoding: "utf8",
+    });
+    assert.notEqual(cli.status, 0, "零命中必须非 0 退出: " + fingerprint);
+    assert.match(cli.stderr, /指纹未命中任何会话/);
+    assert.equal(cli.stdout.trim(), "", "零命中不得输出正文");
+  }
+  // 空指纹与「值缺」同样走退出码 2（与其余错误路径一致）
+  const empty = spawnSync(process.execPath, [CLI, "dump", "--db", dbPath, "--session-by-text", ""], {
+    encoding: "utf8",
+  });
+  assert.equal(empty.status, 2, "空指纹应退出码 2");
+  assert.match(empty.stderr, /需要非空的指纹文本/);
+  const missing = spawnSync(process.execPath, [CLI, "dump", "--db", dbPath, "--session-by-text"], {
+    encoding: "utf8",
+  });
+  assert.equal(missing.status, 2, "缺值应退出码 2");
+  assert.match(missing.stderr, /--session-by-text 需要一个值/);
 });
 
 test("dump：--session-by-text 多命中报错并列候选（绝不静默取第一个）", async () => {
@@ -451,6 +502,24 @@ test("dump：--session-by-text 多命中报错并列候选（绝不静默取第�
   assert.match(cli.stderr, /重复指纹会话乙/);
   assert.match(cli.stderr, /--session/, "必须提示用 --session 明确指定");
   assert.equal(cli.stdout.trim(), "", "多命中不得输出正文");
+});
+
+test("sessions：输出为「时间 / 会话 id / 标题」三列，候选信息完整", async () => {
+  const dbPath = await createFixtureDb();
+  const cli = spawnSync(process.execPath, [CLI, "sessions", "--db", dbPath, "--last", "10"], { encoding: "utf8" });
+  assert.equal(cli.status, 0, cli.stderr);
+  const lines = cli.stdout.split(/\r?\n/).filter((line) => line.trim());
+  assert.match(lines[0], /最近会话/);
+  assert.match(lines[0], /sess_subagent_\* \/ sess_dwf-\*/);
+  const row = lines.find((line) => line.indexOf("sess_main") >= 0);
+  assert.ok(row, "应列出 sess_main");
+  // 格式：两空格 + ISO 时间 + 两空格 + 会话 id + 两空格 + 标题（与多命中候选列表同一格式）
+  assert.match(row, /^\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+sess_main\s+\S/);
+  assert.ok(row.indexOf("主会话") >= 0, "行内应含标题");
+  // 子代理 / 工作流 / 已删除会话都不该出现
+  assert.ok(cli.stdout.indexOf("sess_subagent_abc") < 0, "不得列出子代理会话");
+  assert.ok(cli.stdout.indexOf("sess_dwf-xyz") < 0, "不得列出工作流会话");
+  assert.ok(cli.stdout.indexOf("sess_deleted") < 0, "不得列出已删除会话");
 });
 
 // ---------------------------------------------------------------- 3. 句子分块器
@@ -555,6 +624,21 @@ test("widget：escapeHtml 单测", () => {
 });
 
 // ---------------------------------------------------------------- 5. speak --dry-run 命令构造
+
+test("speak：PS 脚本分块清单必须用 @() 包裹（单元素数组会被 ConvertFrom-Json 摊平成标量）", () => {
+  // 回归：ConvertFrom-Json 对单元素 JSON 数组会摊平成标量，$chunks[0] 只取到第一个字符，
+  // 于是「只念一个字、退出码 0」——单块路径此前完全无自动化覆盖，bug 就这么溜过去的。
+  const script = buildSapiScript();
+  const jsonLines = script.split("\n").filter((line) => line.indexOf("ConvertFrom-Json") >= 0);
+  assert.equal(jsonLines.length, 1, "PS 脚本里只应有一处 ConvertFrom-Json（分块清单解析）");
+  for (const line of jsonLines) {
+    assert.ok(line.indexOf("@(") >= 0, "ConvertFrom-Json 必须被 @() 包裹: " + line.trim());
+    assert.ok(line.indexOf("@(Get-Content") >= 0, "包裹形态应为 @(Get-Content … | ConvertFrom-Json): " + line.trim());
+  }
+  assert.match(script, /@\(Get-Content -Raw -Encoding utf8 -LiteralPath \$ChunksFile \| ConvertFrom-Json\)/);
+  // 分块索引访问依赖数组语义
+  assert.match(script, /\$text = \[string\]\$chunks\[\$i\]/);
+});
 
 test("speak --dry-run：sapi 命令构造（PS7 全路径 + System.Speech + 分块文件）", () => {
   const plan = buildSpeakPlan("【用户】你好。世界。", { engine: "sapi", rate: 0, wav: path.join(TMP, "out.wav") });

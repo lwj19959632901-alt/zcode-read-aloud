@@ -6,7 +6,7 @@
 ```
 read-aloud/
 ├── read-aloud.mjs        单文件 CLI + 片段生成器（dump / speak / widget / voices / sessions）
-├── read-aloud.test.mjs   node:test 单测（33 条）
+├── read-aloud.test.mjs   node:test 单测（35 条）
 ├── smoke_widget.py       Playwright + Chrome 真实浏览器冒烟
 ├── docs/demo.png         演示截图（占位，随首个 Release 补充）
 ├── LICENSE               MIT
@@ -75,7 +75,7 @@ node read-aloud.mjs dump [--session ID | --session-by-text 指纹] [--session-by
 | 参数 | 说明 |
 | --- | --- |
 | `--session <id>` | 指定会话；不传则取 `time_updated` 最新**且排除 `sess_subagent_*` / `sess_dwf-*` 前缀**的会话（库内存在大量 agent 内部派生会话，不排除会取错） |
-| `--session-by-text <指纹>` | **文本指纹定位会话**：在最近 N 个主会话（默认 10，同样排除 `sess_subagent_*` / `sess_dwf-*`）里搜 `part.data.type=='text'` 的正文是否含该子串。与 `--session` **互斥**（两个都给直接报错）。唯一命中→用它；零命中→退出码 2 报「指纹未命中任何会话」；多命中→退出码 2 并**列出全部候选**（id + 标题 + 时间），提示用 `--session` 明确指定。**大小写敏感**（普通子串匹配，不做模糊/归一化） |
+| `--session-by-text <指纹>` | **文本指纹定位会话**：在最近 N 个主会话（默认 10，同样排除 `sess_subagent_*` / `sess_dwf-*`）里搜**真实用户消息**（`role='user'` + `part.type='text'` + 非合成注入）正文是否含该子串。与 `--session` **互斥**（两个都给直接报错）。唯一命中→用它；零命中→退出码 2 报「指纹未命中任何会话」并给三步补救；多命中→退出码 2 并**列出全部候选**（id + 标题 + 时间），提示用 `--session` 明确指定。**大小写敏感**（普通子串匹配，不做模糊/归一化） |
 | `--session-by-text-limit N` | 指纹搜索的候选会话数，默认 10 |
 | `--last N` | 取最后 N 条**消息**（并块前的条数，不是并块后的块数） |
 | `--max-chars N` | 默认 12000，超出截断；截断说明只进 stderr 摘要，不进正文（否则会被 widget/speak 当正文念出来） |
@@ -114,10 +114,19 @@ node read-aloud.mjs dump [--session ID | --session-by-text 指纹] [--session-by
 用法纪律：
 
 1. **先解析出 id，后续每条 dump 都显式带 `--session <id>`**，不要指望默认值一直对。
-2. 指纹**零命中**＝指纹不在最近 10 个主会话里（或写法与原文不一致），换个更短的片段重试。
+2. 指纹**零命中**＝指纹没落在候选集里的真实用户消息上。按三步补救，**顺序别换**：
+   ① **原样重试一次**（会话可能刚落盘、还没进库）；
+   ② 加 `--session-by-text-limit 50` **扩大候选集**（真因通常是「会话不在最近 10 个里」）；
+   ③ 才换更短的指纹片段重试（真因是指纹写错/大小写不对）。
+   —— 顺序反了会一直在「换指纹」上打转，而真因是会话不在候选集。
 3. 指纹**多命中**＝指纹太短/太常见（多个会话都有）。CLI 会列出全部候选
    （会话 id + 标题 + 最近更新时间），**从候选里挑一个并显式 `--session` 指定**，不要猜。
-4. 指纹匹配**大小写敏感**，且只认 `type=='text'` 的 part——`reasoning` / `tool` 里复述的原文不算命中。
+4. 指纹匹配**大小写敏感**；命中判定必须同时满足三条，缺一不可：
+   - `part.data.type === 'text'`（`reasoning` / `tool` 里复述的原文不算）；
+   - 消息与 part **都不是合成注入**（`synthetic` / `visibility:'model-only'` / `runtimeMessage.source`
+     一律排除——宿主注入块在本机散布于上千个会话里，不滤会伪多命中，
+     更危险的是「当前会话不在候选集 + 恰好只有一个别的候选只在合成块里命中」时**唯一命中且静默取错会话**）；
+   - 消息 `role === 'user'`（真实用户消息）。
 5. `--session` 与 `--session-by-text` **互斥**，同时给直接报错（退出码 2）。
 
 ### `sessions` — 列最近会话
@@ -202,6 +211,7 @@ node read-aloud.mjs voices
 | **`edge` 未装即降级** | 本机没装 `edge-tts` | 调 `--engine edge` 直接退出码 2 并给安装提示（`pip install edge-tts`）；不影响默认 `sapi` |
 | **默认会话会取错** | 多窗口并行时，不带 `--session` 的 `dump` 取到另一个窗口的会话且不报错 | 用 `--session-by-text` 指纹定位或显式 `--session`，详见「会话定位」一节 |
 | **`speak` 只吃文件** | 没有直传文本 / stdin 的入口 | 正文先写进文件（**绝对 Windows 路径**，Git Bash 里的 `/tmp/...` 会被 MSYS 改写）再 `speak <文件>` |
+| **PowerShell 单元素数组退化** | `ConvertFrom-Json` 对**单元素** JSON 数组会摊平成标量，`$chunks[0]` 取到的是**第一个字符**——只念一个字，退出码还是 0（静默坏） | 解析 JSON 数组一律用 `@(...)` 包住（`$chunks = @(… \| ConvertFrom-Json)`），保证数组语义；本仓的 PS 脚本已按此写并有单测回归 |
 
 ## 设计说明
 
@@ -256,7 +266,7 @@ AI Agent 会话库里混着大量**非对话内容**：系统提示词、deferre
 ```bash
 node --check read-aloud.mjs
 node --check read-aloud.test.mjs
-node --test read-aloud.test.mjs        # 33 条全绿
+node --test read-aloud.test.mjs        # 35 条全绿
 ```
 
 手动冒烟（Windows）：
@@ -267,6 +277,34 @@ node read-aloud.mjs voices                                          # 应列出�
 node read-aloud.mjs speak ctx.txt --engine sapi --wav out.wav       # 需 ffmpeg 才会合并
 node read-aloud.mjs widget ctx.txt --out button.html
 ```
+
+### 单块合成验收（PowerShell 单元素数组退化回归）
+
+**这是必跑的一条**：单块（只有一句）时 `ConvertFrom-Json` 会把单元素数组摊平成标量，
+`$chunks[0]` 只取到第一个字符——只念一个字、退出码还是 0（静默坏）。
+判据：**控制台打出完整句子** + **wav 时长 ≥ 2s**（14 字以上单句）。
+真 PowerShell 实跑（不真出声，落盘验时长）：
+
+```bash
+# ① 造一个 21 字的单句（只有一块 → 走单元素数组那条路）
+#    路径必须写绝对 Windows 路径：Git Bash 里 $TEMP 是 /tmp（MSYS 路径），会被改写
+printf '【用户】这是一句用于验收的中文朗读测试文本。\n' > "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.txt"
+# ② 真实 PS7 合成到 wav（只落盘不播音）
+node read-aloud.mjs speak "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.txt" --wav "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.wav"
+# ③ 看控制台：必须是完整句子，不能只有第一个字
+#    [1/1] 这是一句用于验收的中文朗读测试文本。
+#    speak: sapi 已合成 1 块 → …（4.36 秒）
+```
+
+wav 时长用 WAV 头算（`dataSize / byteRate`）或 `ffprobe -show_entries format=duration`：
+
+```bash
+ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.wav"
+```
+
+实测基线（2026-11-01，PS 7 + `Microsoft Huihui Desktop`）：控制台 `[1/1] 这是一句用于验收的中文朗读测试文本。`，
+wav **4.36 秒**（退化版本是 `[1/1] 这` + 1.12 秒）。单测里有 `@()` 包裹的模板回归断言，
+但**真实 PS 合成仍需手跑一次**——模板断言挡不住 PS 解释器语义变化。
 
 真实浏览器冒烟（可选）：`smoke_widget.py` 用 Playwright + Chrome 加载一个**把片段包进沙箱 iframe**
 的 standalone HTML（应用内由 `::visualize` 渲染管线生成这一步），断言 DOM 标记齐全、无
@@ -279,7 +317,9 @@ python smoke_widget.py <standalone.html>
 ```
 
 单测覆盖：dump 提取（排序/角色/代码略/`--last`/`--max-chars`/消息级与 part 级合成标记过滤/内部会话前缀过滤）、
-**会话指纹定位**（唯一命中选中正确会话 / 与 `--session` 互斥 / 零命中报错 / 多命中报错并列候选）、
+**会话指纹定位**（唯一命中选中正确会话 / 与 `--session` 互斥 / 零命中报错 / 多命中报错并列候选 /
+合成注入与助手消息不参与匹配 / 更旧会话也能命中）、`sessions` 输出三列格式、
+**PS 分块清单 `@()` 包裹回归**（单元素数组退化）、
 句子分块器（中文标点/超长二次切分/无空块）、widget 生成（HTML 转义/根 id/无 fetch/XHR/内联脚本 `node --check`）、
 `speak --dry-run` 命令构造（sapi/minimax）、spawn 失败 fail-closed（注入 mock spawnSync，不真调 PS7）、
 取值型参数缺值报错、wav 头解析、voices 选择，

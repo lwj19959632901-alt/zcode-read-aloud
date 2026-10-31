@@ -4,6 +4,7 @@
 // 子命令：
 //   dump     从 ZCode db.sqlite（只读）提取会话上下文 → 纯文本（角色标注 + 代码块占位）
 //            会话定位：--session <id> 显式指定 / --session-by-text <指纹> 文本指纹定位（互斥）；
+//            指纹只认真实用户消息（role=user + type=text + 非合成注入）；
 //            都不给才走默认解析（最近更新的主会话，多窗口并行时会取错，故只在明确知道时用）
 //   speak    无头朗读（引擎 sapi 默认 / minimax / edge；--dry-run 只打印命令）
 //   widget   把 dump 文本生成内联 HTML 片段（ZCode Gen UI，宿主唯一受支持的 UI 面）
@@ -149,15 +150,19 @@ function formatSessionLine(row) {
   return "  " + when + "  " + row.id + "  " + title;
 }
 
-// 指纹定位会话：在最近 limit 个主会话里找「part.data.type=='text' 且正文含该子串」的会话。
+// 指纹定位会话：在最近 limit 个主会话里找「真实用户消息的正文含该子串」的会话。
 //
 // 为什么需要它：默认解析取的是「最近更新的主会话」，多窗口并行时会静默取到另一个窗口的会话
 // （本机实测默认取到并行窗口的会话、当前对话在另一个 id，且不报错）。
-// 匹配判定放在 JS 侧，不靠 SQL LIKE：
-//   1) 只认 part.data.type === 'text'（reasoning / tool 里也会出现原文片段，不能算命中）；
-//   2) 大小写敏感（SQL LIKE 对 ASCII 不敏感，会把匹配放宽）；
-//   3) 指纹里的引号/反斜杠在库里是 JSON 转义后的形态，预筛要用转义后的串才不会漏。
-// SQL LIKE 只作预筛（宽进严出，预筛漏了才致命），真判定永远以 indexOf 为准。
+// 命中判定（三条同时成立才算命中，缺一不可）：
+//   1) part.data.type === 'text'（reasoning / tool 里也会出现原文片段，不能算命中）；
+//   2) 消息与 part 都不是合成注入（复用 isSyntheticRecord）——宿主注入的 synthetic 块
+//      （role=user/type=text/synthetic=true/visibility=model-only/src=tool_search_announcement
+//      等）在本机散布于上千个会话里，不滤掉就会伪多命中；更危险的是「当前会话不在候选集 +
+//      恰好只有一个别的候选只在 synthetic 块里命中」时会**唯一命中且静默取错会话**；
+//   3) 消息 role === 'user'（真实用户消息即 role=user + type=text；助手复述不算）。
+// 匹配用 JS 侧的 indexOf（大小写敏感）；SQL LIKE 只作预筛（宽进严出），
+// 预筛用 JSON 转义后的指纹形态（引号/反斜杠在库里是转义过的）。
 function findSessionsByText(db, fingerprint, limit) {
   const needle = String(fingerprint == null ? "" : fingerprint);
   if (!needle.trim()) throw new Error("--session-by-text 需要非空的指纹文本");
@@ -170,14 +175,17 @@ function findSessionsByText(db, fingerprint, limit) {
     for (const pattern of patterns) {
       const rows = db
         .prepare(
-          "SELECT p.data AS pdata FROM message m JOIN part p ON p.message_id = m.id " +
+          "SELECT m.data AS mdata, p.data AS pdata FROM message m JOIN part p ON p.message_id = m.id " +
             "WHERE m.session_id = ? AND p.data LIKE ?"
         )
         .all(session.id, "%" + pattern + "%");
       for (const row of rows) {
-        const data = parseJson(row.pdata);
-        if (!data || data.type !== "text") continue;
-        const text = typeof data.text === "string" ? data.text : "";
+        const mdata = parseJson(row.mdata) || {};
+        const pdata = parseJson(row.pdata) || {};
+        if (pdata.type !== "text") continue;
+        if (isSyntheticRecord(mdata) || isSyntheticRecord(pdata)) continue;
+        if (mdata.role !== "user") continue;
+        const text = typeof pdata.text === "string" ? pdata.text : "";
         if (text.indexOf(needle) >= 0) {
           matched = true;
           break;
@@ -261,6 +269,7 @@ function resolveDumpSessionId(db, options) {
     die("--session 与 --session-by-text 互斥：只能给其中一个");
   }
   if (fingerprint !== undefined) {
+    if (!String(fingerprint).trim()) die("--session-by-text 需要非空的指纹文本");
     const limit =
       options["session-by-text-limit"] === undefined
         ? SESSION_TEXT_SEARCH_LIMIT
@@ -269,7 +278,10 @@ function resolveDumpSessionId(db, options) {
     const hits = findSessionsByText(db, fingerprint, limit);
     if (!hits.length) {
       die(
-        "指纹未命中任何会话（在最近 " + limit + " 个主会话的 text part 里没找到该子串）：" + fingerprint
+        "指纹未命中任何会话（在最近 " + limit + " 个主会话的真实用户消息里没找到该子串）：" + fingerprint +
+          "\n三步补救：① 原样重试一次（会话可能还没落盘）；" +
+          "② 加 --session-by-text-limit 50 扩大候选集；" +
+          "③ 才换更短的指纹片段重试。"
       );
     }
     if (hits.length > 1) {
@@ -397,6 +409,14 @@ function buildSpeechChunks(messages, maxLen) {
 // ---------------------------------------------------------------- SAPI（PowerShell 侧脚本）
 
 // 文本一律经文件传递（chunks.json + manifest.txt），不经命令行，规避引号/编码坑。
+//
+// 单元素数组退化（PowerShell 坑）：`ConvertFrom-Json` 对 **单元素** JSON 数组会把它摊平成标量
+// （`["你好"]` → 字符串 "你好"），于是 `$chunks[0]` 取到的是**第一个字符**，只念一个字还照样退出码 0。
+// 修法：分块清单解析必须用 `@(...)` 包住，保证数组语义（`@()` 对多元素无副作用）。
+// 同类点已全量审过：
+//   - 分块清单解析（ConvertFrom-Json）→ 已用 @() 包裹（本 bug 的根因，单测有回归断言）；
+//   - voices 枚举（GetInstalledVoices | ForEach-Object）→ 走管道不涉 JSON，无退化面；
+//   - manifest 读取（Add-Content 逐行写、Node 侧按行读）→ 纯文本逐行，无退化面。
 function buildSapiScript() {
   return [
     "param(",
@@ -421,7 +441,7 @@ function buildSapiScript() {
     "    if ($hit -ne $null) { $synth.SelectVoice($hit.VoiceInfo.Name) }",
     "  }",
     "  if ($Rate -ne 0) { $synth.Rate = $Rate }",
-    "  $chunks = Get-Content -Raw -Encoding utf8 -LiteralPath $ChunksFile | ConvertFrom-Json",
+    "  $chunks = @(Get-Content -Raw -Encoding utf8 -LiteralPath $ChunksFile | ConvertFrom-Json)",
     "  $total = @($chunks).Count",
     "  for ($i = 0; $i -lt $total; $i++) {",
     "    $text = [string]$chunks[$i]",
@@ -1298,6 +1318,7 @@ if (invokedDirectly) {
 }
 
 export {
+  buildSapiScript,
   buildSpeechChunks,
   buildSpeakPlan,
   buildWidgetFragment,
