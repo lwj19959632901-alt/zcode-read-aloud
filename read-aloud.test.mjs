@@ -18,6 +18,7 @@ import {
   buildWidgetFragment,
   escapeHtml,
   extractMessages,
+  findSessionsByText,
   formatDump,
   mergeConsecutive,
   openDatabase,
@@ -166,6 +167,9 @@ async function createFixtureDb() {
   insertSession.run("sess_main", "主会话", 3000, null);
   // 连续同角色消息：用来钉死 --last 按「消息」计、不按「并块后」计
   insertSession.run("sess_consecutive", "连续同角色会话", 2000, null);
+  // 两个都含同一段指纹文本的主会话：用来钉死「多命中必须报错并列候选」，绝不静默取第一个
+  insertSession.run("sess_dup_a", "重复指纹会话甲", 2500, null);
+  insertSession.run("sess_dup_b", "重复指纹会话乙", 2400, null);
 
   const insertMessage = db.prepare("INSERT INTO message (id, session_id, data, sequence) VALUES (?, ?, ?, ?)");
   const insertPart = db.prepare("INSERT INTO part (id, message_id, session_id, data, sequence) VALUES (?, ?, ?, ?, ?)");
@@ -183,6 +187,26 @@ async function createFixtureDb() {
     insertMessage.run(messageId, "sess_consecutive", JSON.stringify({ role: "assistant" }), i - 1);
     insertPart.run("cp" + i, messageId, "sess_consecutive", JSON.stringify({ type: "text", text: "连续助手消息" + i + "。" }), 0);
   }
+  // 指纹定位用的共享文本：sess_dup_a / sess_dup_b 各一条，另在 sess_dup_a 里塞一条
+  // reasoning part 复述同一段文字——只有 text part 才算命中（reasoning 不算）。
+  for (const target of ["sess_dup_a", "sess_dup_b"]) {
+    insertMessage.run("dup_msg_" + target, target, JSON.stringify({ role: "user" }), 0);
+    insertPart.run(
+      "dup_part_" + target,
+      "dup_msg_" + target,
+      target,
+      JSON.stringify({ type: "text", text: "共享指纹文本，用于多命中测试。" }),
+      0
+    );
+  }
+  insertMessage.run("dup_msg_reasoning", "sess_dup_a", JSON.stringify({ role: "assistant" }), 1);
+  insertPart.run(
+    "dup_part_reasoning",
+    "dup_msg_reasoning",
+    "sess_dup_a",
+    JSON.stringify({ type: "reasoning", text: "共享指纹文本，用于多命中测试。" }),
+    0
+  );
   } catch (err) {
     db.close();
     throw err;
@@ -368,7 +392,68 @@ test("dump：--session 显式指定时可读子代理会话（过滤只作用于
   assert.equal(def.stderr.indexOf("sess_main") >= 0, true, "默认会话应为 sess_main");
 });
 
-// ---------------------------------------------------------------- 2. 句子分块器
+// ---------------------------------------------------------------- 2. 会话指纹定位
+
+test("dump：--session-by-text 唯一命中选中正确会话（且与 --session 互斥）", async () => {
+  const dbPath = await createFixtureDb();
+  const db = await openDatabase(dbPath);
+  try {
+    const hits = findSessionsByText(db, "第一轮提问。", 10);
+    assert.equal(hits.length, 1, "指纹应只命中 sess_main");
+    assert.equal(hits[0].id, "sess_main");
+    // 指纹命中不等于「最近更新的会话」：sess_consecutive 更旧也必须能被搜到
+    const older = findSessionsByText(db, "连续助手消息3。", 10);
+    assert.equal(older.length, 1);
+    assert.equal(older[0].id, "sess_consecutive");
+  } finally {
+    db.close();
+  }
+
+  const cli = spawnSync(process.execPath, [CLI, "dump", "--db", dbPath, "--session-by-text", "第一轮提问。"], {
+    encoding: "utf8",
+  });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.match(cli.stdout, /【用户】第一轮提问。/);
+  assert.match(cli.stderr, /sess_main/, "摘要里应报出解析到的会话 id");
+
+  // 与 --session 互斥：两个都给必须报错，不许静默取其中一个
+  const both = spawnSync(
+    process.execPath,
+    [CLI, "dump", "--db", dbPath, "--session", "sess_main", "--session-by-text", "第一轮提问。"],
+    { encoding: "utf8" }
+  );
+  assert.notEqual(both.status, 0, "--session 与 --session-by-text 同时给必须非 0 退出");
+  assert.match(both.stderr, /互斥/);
+});
+
+test("dump：--session-by-text 零命中报错（指纹未命中任何会话）", async () => {
+  const dbPath = await createFixtureDb();
+  const cli = spawnSync(
+    process.execPath,
+    [CLI, "dump", "--db", dbPath, "--session-by-text", "绝对不会出现在任何会话里的指纹串"],
+    { encoding: "utf8" }
+  );
+  assert.notEqual(cli.status, 0, "零命中必须非 0 退出");
+  assert.match(cli.stderr, /指纹未命中任何会话/);
+  assert.equal(cli.stdout.trim(), "", "零命中不得输出正文");
+});
+
+test("dump：--session-by-text 多命中报错并列候选（绝不静默取第一个）", async () => {
+  const dbPath = await createFixtureDb();
+  const cli = spawnSync(process.execPath, [CLI, "dump", "--db", dbPath, "--session-by-text", "共享指纹文本"], {
+    encoding: "utf8",
+  });
+  assert.notEqual(cli.status, 0, "多命中必须非 0 退出");
+  assert.match(cli.stderr, /命中多个会话/);
+  assert.match(cli.stderr, /sess_dup_a/);
+  assert.match(cli.stderr, /sess_dup_b/);
+  assert.match(cli.stderr, /重复指纹会话甲/);
+  assert.match(cli.stderr, /重复指纹会话乙/);
+  assert.match(cli.stderr, /--session/, "必须提示用 --session 明确指定");
+  assert.equal(cli.stdout.trim(), "", "多命中不得输出正文");
+});
+
+// ---------------------------------------------------------------- 3. 句子分块器
 
 test("分块器：中文标点切分，标点保留在前块", () => {
   assert.deepEqual(splitSentences("你好。世界！测试？"), ["你好。", "世界！", "测试？"]);
@@ -398,7 +483,7 @@ test("分块器：buildSpeechChunks 跳过代码块正文并flatten所有消息"
   assert.deepEqual(chunks, ["看代码：", "（代码略）", "结束。", "回答一。", "回答二。"]);
 });
 
-// ---------------------------------------------------------------- 3. widget 片段生成
+// ---------------------------------------------------------------- 4. widget 片段生成
 
 function widgetHtml() {
   return buildWidgetFragment([
@@ -469,7 +554,7 @@ test("widget：escapeHtml 单测", () => {
   assert.equal(escapeHtml(null), "");
 });
 
-// ---------------------------------------------------------------- 4. speak --dry-run 命令构造
+// ---------------------------------------------------------------- 5. speak --dry-run 命令构造
 
 test("speak --dry-run：sapi 命令构造（PS7 全路径 + System.Speech + 分块文件）", () => {
   const plan = buildSpeakPlan("【用户】你好。世界。", { engine: "sapi", rate: 0, wav: path.join(TMP, "out.wav") });
@@ -547,7 +632,7 @@ test("speak/dump/widget：取值型标志缺值时当场报错，不把 true 泄
   }
 });
 
-// ---------------------------------------------------------------- 5. wav 头解析
+// ---------------------------------------------------------------- 6. wav 头解析
 
 function makeWavBytes(dataSize, byteRate, actualDataBytes) {
   const buf = Buffer.alloc(44 + actualDataBytes);
@@ -585,7 +670,7 @@ test("wav 头解析：时长=dataSize/byteRate，截断可识别", () => {
   assert.equal(readWavInfo(path.join(TMP, "missing.wav")), null);
 });
 
-// ---------------------------------------------------------------- 6. voices 选择
+// ---------------------------------------------------------------- 7. voices 选择
 
 test("voices：pickSapiVoice 优先 zh-CN 与 Huihui", () => {
   const voices = [
@@ -601,7 +686,7 @@ test("voices：pickSapiVoice 优先 zh-CN 与 Huihui", () => {
   assert.equal(roleLabel(null), "文本");
 });
 
-// ---------------------------------------------------------------- 7. widget 交互冒烟（vm + fake DOM）
+// ---------------------------------------------------------------- 8. widget 交互冒烟（vm + fake DOM）
 
 function makeElement(id, scrolled) {
   const listeners = {};

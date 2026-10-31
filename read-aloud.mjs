@@ -3,6 +3,8 @@
 //
 // 子命令：
 //   dump     从 ZCode db.sqlite（只读）提取会话上下文 → 纯文本（角色标注 + 代码块占位）
+//            会话定位：--session <id> 显式指定 / --session-by-text <指纹> 文本指纹定位（互斥）；
+//            都不给才走默认解析（最近更新的主会话，多窗口并行时会取错，故只在明确知道时用）
 //   speak    无头朗读（引擎 sapi 默认 / minimax / edge；--dry-run 只打印命令）
 //   widget   把 dump 文本生成内联 HTML 片段（ZCode Gen UI，宿主唯一受支持的 UI 面）
 //   voices   列 SAPI 语音（标注 zh-CN，并说明与浏览器语音表的差异）
@@ -33,6 +35,7 @@ const SAPI_MAX_CHUNK = 120; // SAPI 单块上限（超长走二次切分）
 const MINIMAX_MAX_CHUNK = 3000; // llm.mjs tts 的位置参数上限（Windows 命令行安全区）
 const WIDGET_MAX_SENTENCE = 200; // 片段里单句展示上限
 const SAPI_VOICE_PREFERENCE = ["Microsoft Huihui", "Yaoyao", "Kangkang"];
+const SESSION_TEXT_SEARCH_LIMIT = 10; // --session-by-text 默认在最近 10 个主会话里找指纹
 const PS7 = "C:/Program Files/PowerShell/7/pwsh.exe";
 const LOCAL_AI_LLM = path.join(os.homedir(), ".zcode", "skills", "local-ai", "llm.mjs");
 const WIDGET_ROOT_ID = "read-aloud-widget";
@@ -139,6 +142,54 @@ function resolveSessionId(db, explicit) {
   return row.id;
 }
 
+// 会话行的一行展示（sessions 列表与多命中候选共用同一格式，保证两处信息一致）。
+function formatSessionLine(row) {
+  const when = new Date(row.time_updated).toISOString().replace("T", " ").slice(0, 19);
+  const title = String(row.title || "").replace(/\s+/g, " ").slice(0, 60);
+  return "  " + when + "  " + row.id + "  " + title;
+}
+
+// 指纹定位会话：在最近 limit 个主会话里找「part.data.type=='text' 且正文含该子串」的会话。
+//
+// 为什么需要它：默认解析取的是「最近更新的主会话」，多窗口并行时会静默取到另一个窗口的会话
+// （本机实测默认取到并行窗口的会话、当前对话在另一个 id，且不报错）。
+// 匹配判定放在 JS 侧，不靠 SQL LIKE：
+//   1) 只认 part.data.type === 'text'（reasoning / tool 里也会出现原文片段，不能算命中）；
+//   2) 大小写敏感（SQL LIKE 对 ASCII 不敏感，会把匹配放宽）；
+//   3) 指纹里的引号/反斜杠在库里是 JSON 转义后的形态，预筛要用转义后的串才不会漏。
+// SQL LIKE 只作预筛（宽进严出，预筛漏了才致命），真判定永远以 indexOf 为准。
+function findSessionsByText(db, fingerprint, limit) {
+  const needle = String(fingerprint == null ? "" : fingerprint);
+  if (!needle.trim()) throw new Error("--session-by-text 需要非空的指纹文本");
+  const candidates = listSessions(db, limit == null ? SESSION_TEXT_SEARCH_LIMIT : limit);
+  const escaped = JSON.stringify(needle).slice(1, -1);
+  const patterns = escaped === needle ? [needle] : [escaped, needle];
+  const hits = [];
+  for (const session of candidates) {
+    let matched = false;
+    for (const pattern of patterns) {
+      const rows = db
+        .prepare(
+          "SELECT p.data AS pdata FROM message m JOIN part p ON p.message_id = m.id " +
+            "WHERE m.session_id = ? AND p.data LIKE ?"
+        )
+        .all(session.id, "%" + pattern + "%");
+      for (const row of rows) {
+        const data = parseJson(row.pdata);
+        if (!data || data.type !== "text") continue;
+        const text = typeof data.text === "string" ? data.text : "";
+        if (text.indexOf(needle) >= 0) {
+          matched = true;
+          break;
+        }
+      }
+      if (matched) break;
+    }
+    if (matched) hits.push(session);
+  }
+  return hits;
+}
+
 // 过滤后的逐条消息（一条 DB 消息一项；同一消息的多个 text part 用空行相接）。
 // 注意：这里【不并块】——--last 要按消息数切，必须作用在并块之前的列表上。
 function readTextMessages(db, sessionId) {
@@ -195,6 +246,45 @@ function replaceCodeBlocks(text) {
 function roleLabel(role) {
   if (!role) return "文本";
   return ROLE_LABELS[role] || role;
+}
+
+// ---------------------------------------------------------------- dump 会话解析
+
+// dump 的会话解析：--session（显式 id）与 --session-by-text（文本指纹）互斥，都不给才走默认解析。
+// 默认解析取「最近更新的主会话」——多窗口并行时会静默取到另一个窗口的会话，因此指纹命中唯一时
+// 必须显式带 --session；零命中 / 多命中一律报错退出，绝不猜。
+function resolveDumpSessionId(db, options) {
+  const explicit = options.session === undefined ? undefined : valueOption(options.session, "session");
+  const fingerprint =
+    options["session-by-text"] === undefined ? undefined : valueOption(options["session-by-text"], "session-by-text");
+  if (explicit !== undefined && fingerprint !== undefined) {
+    die("--session 与 --session-by-text 互斥：只能给其中一个");
+  }
+  if (fingerprint !== undefined) {
+    const limit =
+      options["session-by-text-limit"] === undefined
+        ? SESSION_TEXT_SEARCH_LIMIT
+        : Number(valueOption(options["session-by-text-limit"], "session-by-text-limit"));
+    if (!Number.isInteger(limit) || limit <= 0) die("--session-by-text-limit 需要正整数");
+    const hits = findSessionsByText(db, fingerprint, limit);
+    if (!hits.length) {
+      die(
+        "指纹未命中任何会话（在最近 " + limit + " 个主会话的 text part 里没找到该子串）：" + fingerprint
+      );
+    }
+    if (hits.length > 1) {
+      die(
+        "指纹命中多个会话，无法自动判定（" + hits.length + " 个候选）：\n" +
+          hits.map(formatSessionLine).join("\n") +
+          "\n请用 --session <id> 明确指定其中一个。"
+      );
+    }
+    return hits[0].id;
+  }
+  if (explicit !== undefined && !String(explicit).trim()) {
+    die("--session 需要一个非空的会话 id");
+  }
+  return resolveSessionId(db, explicit);
 }
 
 // ---------------------------------------------------------------- dump 文本格式（可往返）
@@ -1013,7 +1103,7 @@ async function cmdDump(options) {
   const dbPath = pathOption(options.db, "db") || defaultDbPath();
   const db = await openDatabase(dbPath);
   try {
-    const sessionId = resolveSessionId(db, valueOption(options.session, "session"));
+    const sessionId = resolveDumpSessionId(db, options);
     // --last 按【消息】计：先取过滤后的逐条消息，切完再并块（并块会吞掉同类相邻消息的条数）。
     const raw = readTextMessages(db, sessionId);
     // 会话不存在（或全被合成过滤掉）时不得静默空转：rc=0 + 空输出会把「取错会话」扮成成功。
@@ -1153,9 +1243,7 @@ async function cmdSessions(options) {
     }
     process.stdout.write("最近会话（已排除 sess_subagent_* / sess_dwf-* 前缀的子代理与工作流会话）：\n");
     for (const row of rows) {
-      const when = new Date(row.time_updated).toISOString().replace("T", " ").slice(0, 19);
-      const title = String(row.title || "").replace(/\s+/g, " ").slice(0, 60);
-      process.stdout.write("  " + when + "  " + row.id + "  " + title + "\n");
+      process.stdout.write(formatSessionLine(row) + "\n");
     }
   } finally {
     db.close();
@@ -1167,7 +1255,7 @@ async function cmdSessions(options) {
 const USAGE = [
   "read-aloud.mjs — 朗读当前会话上下文",
   "",
-  "  dump      [--session ID] [--last N] [--max-chars N] [--out 文件] [--db 路径]",
+  "  dump      [--session ID | --session-by-text 指纹] [--session-by-text-limit N] [--last N] [--max-chars N] [--out 文件] [--db 路径]",
   "  speak     <文本文件> [--engine sapi|minimax|edge] [--voice 名字] [--rate -10..10] [--wav out.wav] [--dry-run] [--llm 路径]",
   "  widget    <文本文件> (--out 文件 | --vizdir 目录 [--title 标题])",
   "  voices",
@@ -1216,6 +1304,7 @@ export {
   defaultDbPath,
   escapeHtml,
   extractMessages,
+  findSessionsByText,
   formatDump,
   openDatabase,
   parseDump,

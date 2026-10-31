@@ -6,7 +6,7 @@
 ```
 read-aloud/
 ├── read-aloud.mjs        单文件 CLI + 片段生成器（dump / speak / widget / voices / sessions）
-├── read-aloud.test.mjs   node:test 单测（30 条）
+├── read-aloud.test.mjs   node:test 单测（33 条）
 ├── smoke_widget.py       Playwright + Chrome 真实浏览器冒烟
 ├── docs/demo.png         演示截图（占位，随首个 Release 补充）
 ├── LICENSE               MIT
@@ -44,6 +44,8 @@ read-aloud/
 node read-aloud.mjs dump --session <your-session-id> --out ctx.txt
 #    不确定会话 id？先列一下最近的会话：
 node read-aloud.mjs sessions
+#    知道当前对话里的一句原文？用文本指纹直接定位（推荐，见「会话定位」）：
+node read-aloud.mjs dump --session-by-text "<当前对话最近一条用户消息原文>" --out ctx.txt
 
 # 2) 无头朗读（默认 sapi 引擎，离线零成本）
 node read-aloud.mjs speak ctx.txt
@@ -67,12 +69,14 @@ node read-aloud.mjs widget ctx.txt --out read-aloud-context.html
 ### `dump` — 从 db.sqlite 提取会话上下文 → 纯文本
 
 ```bash
-node read-aloud.mjs dump [--session ID] [--last N] [--max-chars N] [--out 文件] [--db 路径]
+node read-aloud.mjs dump [--session ID | --session-by-text 指纹] [--session-by-text-limit N] [--last N] [--max-chars N] [--out 文件] [--db 路径]
 ```
 
 | 参数 | 说明 |
 | --- | --- |
 | `--session <id>` | 指定会话；不传则取 `time_updated` 最新**且排除 `sess_subagent_*` / `sess_dwf-*` 前缀**的会话（库内存在大量 agent 内部派生会话，不排除会取错） |
+| `--session-by-text <指纹>` | **文本指纹定位会话**：在最近 N 个主会话（默认 10，同样排除 `sess_subagent_*` / `sess_dwf-*`）里搜 `part.data.type=='text'` 的正文是否含该子串。与 `--session` **互斥**（两个都给直接报错）。唯一命中→用它；零命中→退出码 2 报「指纹未命中任何会话」；多命中→退出码 2 并**列出全部候选**（id + 标题 + 时间），提示用 `--session` 明确指定。**大小写敏感**（普通子串匹配，不做模糊/归一化） |
+| `--session-by-text-limit N` | 指纹搜索的候选会话数，默认 10 |
 | `--last N` | 取最后 N 条**消息**（并块前的条数，不是并块后的块数） |
 | `--max-chars N` | 默认 12000，超出截断；截断说明只进 stderr 摘要，不进正文（否则会被 widget/speak 当正文念出来） |
 | `--out <文件>` | 落盘（默认 stdout）；摘要信息一律走 stderr，stdout 保持纯净可管道 |
@@ -92,6 +96,29 @@ node read-aloud.mjs dump [--session ID] [--last N] [--max-chars N] [--out 文件
   stderr 摘要同时报消息数与并块后的块数，例如 `消息 6/23 条（并块后 1 块）`。
 - 输出格式：每条消息首行 `【用户】` / `【助手】` 前缀，消息间空行。正文里若出现以 `【` 开头的行，
   写盘时加零宽空格（U+200B）转义、读盘时剥掉，`formatDump` / `parseDump` 往返无损。
+
+### 会话定位：指纹法 vs 显式 `--session`（**绝不依赖默认会话**）
+
+默认解析取的是「`time_updated` 最新的主会话」。**多窗口并行时它会静默取到另一个窗口的会话**——
+本机实测：当前对话在 `sess_6002fc29`，不带 `--session` 的 `dump` 取到的是并行窗口的
+`sess_2fe7a446`（llm-distill 会话），**不报错、不提示**。这类「取错会话」比报错更危险：
+朗读/渲染出来的是另一个窗口的内容。
+
+两种可靠定位法：
+
+| 方式 | 命令 | 适用 |
+| --- | --- | --- |
+| 文本指纹（推荐，自动化场景） | `node read-aloud.mjs dump --session-by-text "<当前对话最近一条用户消息原文>"` | 拿当前对话原文当指纹；唯一命中即确定 |
+| 显式 id | `node read-aloud.mjs dump --session <id>` | 已经知道 id（`sessions` 列表里有） |
+
+用法纪律：
+
+1. **先解析出 id，后续每条 dump 都显式带 `--session <id>`**，不要指望默认值一直对。
+2. 指纹**零命中**＝指纹不在最近 10 个主会话里（或写法与原文不一致），换个更短的片段重试。
+3. 指纹**多命中**＝指纹太短/太常见（多个会话都有）。CLI 会列出全部候选
+   （会话 id + 标题 + 最近更新时间），**从候选里挑一个并显式 `--session` 指定**，不要猜。
+4. 指纹匹配**大小写敏感**，且只认 `type=='text'` 的 part——`reasoning` / `tool` 里复述的原文不算命中。
+5. `--session` 与 `--session-by-text` **互斥**，同时给直接报错（退出码 2）。
 
 ### `sessions` — 列最近会话
 
@@ -165,6 +192,17 @@ node read-aloud.mjs voices
 | `minimax` | MiniMax 订阅 + TTS 包装脚本（默认尝试 `~/.zcode/skills/local-ai/llm.mjs`，`--llm` 可指定任意 OpenAI 兼容等效脚本） | 取决于所用订阅 | 提质可选项，须显式 `--engine minimax` |
 | `edge` | `edge-tts` CLI（`pip install edge-tts`） | 免费需联网 | 未安装则退出码 2 并给安装提示 |
 
+## 已知坑位（实测踩过的）
+
+| 坑 | 现象 | 对策 |
+| --- | --- | --- |
+| **widget 文件名前缀** | `--vizdir <目录>` 的产物名是 `read-aloud-<title>.html`，不是 `<title>.html` | 想要 `read-aloud-context.html` 就传 `--title context`（默认 title 已经是 `context`，但显式写更省心）；`--out` 则是原样文件名，不加前缀 |
+| **PS7 必须全路径** | 用短名 `pwsh` 会解析到 WindowsApps 的应用别名桩（85 字节），**静默失败**（计划任务里尤其容易踩） | 一律用 `C:/Program Files/PowerShell/7/pwsh.exe`（CLI 里已硬编码这个全路径） |
+| **`minimax` 消耗额度** | `--engine minimax` 走 local-ai 的 `llm.mjs tts`，属**套餐内**调用，但**会消耗订阅额度** | 默认引擎是离线零成本的 `sapi`；只在确实需要提质时显式 `--engine minimax` |
+| **`edge` 未装即降级** | 本机没装 `edge-tts` | 调 `--engine edge` 直接退出码 2 并给安装提示（`pip install edge-tts`）；不影响默认 `sapi` |
+| **默认会话会取错** | 多窗口并行时，不带 `--session` 的 `dump` 取到另一个窗口的会话且不报错 | 用 `--session-by-text` 指纹定位或显式 `--session`，详见「会话定位」一节 |
+| **`speak` 只吃文件** | 没有直传文本 / stdin 的入口 | 正文先写进文件（**绝对 Windows 路径**，Git Bash 里的 `/tmp/...` 会被 MSYS 改写）再 `speak <文件>` |
+
 ## 设计说明
 
 ### 文本经文件传递（及仅有的两个 argv 例外）
@@ -218,7 +256,7 @@ AI Agent 会话库里混着大量**非对话内容**：系统提示词、deferre
 ```bash
 node --check read-aloud.mjs
 node --check read-aloud.test.mjs
-node --test read-aloud.test.mjs        # 30 条全绿
+node --test read-aloud.test.mjs        # 33 条全绿
 ```
 
 手动冒烟（Windows）：
@@ -241,6 +279,7 @@ python smoke_widget.py <standalone.html>
 ```
 
 单测覆盖：dump 提取（排序/角色/代码略/`--last`/`--max-chars`/消息级与 part 级合成标记过滤/内部会话前缀过滤）、
+**会话指纹定位**（唯一命中选中正确会话 / 与 `--session` 互斥 / 零命中报错 / 多命中报错并列候选）、
 句子分块器（中文标点/超长二次切分/无空块）、widget 生成（HTML 转义/根 id/无 fetch/XHR/内联脚本 `node --check`）、
 `speak --dry-run` 命令构造（sapi/minimax）、spawn 失败 fail-closed（注入 mock spawnSync，不真调 PS7）、
 取值型参数缺值报错、wav 头解析、voices 选择，
