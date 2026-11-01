@@ -26,6 +26,7 @@ REQUIRED_SELECTORS = [
     "#ra-pause",
     "#ra-stop",
     "#ra-rate",
+    "#ra-voice",
     "#ra-progress",
     "#ra-progress-bar",
     "#ra-transcript",
@@ -169,6 +170,28 @@ def main() -> int:
                         failures.append("倍速偏好未正确写入，实际: %r" % (rate,))
                 except Exception as exc:  # noqa: BLE001
                     failures.append("倍速写入未触发: " + str(exc).splitlines()[0])
+
+                # 音色下拉：应有 zh 语音选项，且切换写入 privateContent.voice
+                try:
+                    options = frame.eval_on_selector_all("#ra-voice option", "els => els.map(el => el.value)")
+                    notes.append("音色下拉选项 %d 个" % len(options))
+                    if not options:
+                        failures.append("音色下拉没有选项")
+                    else:
+                        target_voice = options[-1]
+                        frame.select_option("#ra-voice", target_voice)
+                        frame.wait_for_function(
+                            "() => { const w = window.__raProbe ? window.__raProbe.stateWrites : [];"
+                            " return w.length >= 1 && !!(w[w.length - 1].privateContent || {}).voice; }",
+                            timeout=10000,
+                        )
+                        latest = frame.evaluate("() => window.__raProbe.stateWrites.slice(-1)[0]")
+                        written = (latest or {}).get("privateContent", {}).get("voice")
+                        notes.append("setWidgetState 写入音色: %s" % written)
+                        if written != target_voice:
+                            failures.append("音色偏好未正确写入，期望 %r 实际 %r" % (target_voice, written))
+                except Exception as exc:  # noqa: BLE001
+                    failures.append("音色下拉未生效: " + str(exc).splitlines()[0])
 
                 # 停止
                 frame.locator("#ra-stop").click()

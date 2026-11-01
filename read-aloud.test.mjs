@@ -17,18 +17,25 @@ import {
   buildSpeechChunks,
   buildSpeakPlan,
   buildWidgetFragment,
+  edgeRateArg,
   escapeHtml,
   extractMessages,
   findSessionsByText,
   formatDump,
+  isEdgeUnavailable,
+  listEdgeVoices,
   mergeConsecutive,
   openDatabase,
   parseDump,
+  parseEdgeVoiceTable,
   pickSapiVoice,
+  playWav,
+  PLAY_WAV_SCRIPT,
   printPlan,
   readTextMessages,
   readWavInfo,
   replaceCodeBlocks,
+  resolveEdgeVoice,
   resolveSessionId,
   roleLabel,
   runSapi,
@@ -672,6 +679,162 @@ test("speak --dry-run：minimax 走 local-ai 入口且分块 ≤3000 字", () =>
   assert.match(printed, /≤3000/);
 });
 
+// ---------------------------------------------------------------- 5b. edge 引擎：音色/语速/产物路径
+
+// 注入用的 spawn 桩：edge-tts 未安装（ENOENT）时 node 的 spawnSync 返回 { error, status: null }
+function missingEdgeSpawn() {
+  const spy = function (command) {
+    if (command === "edge-tts") return { error: Object.assign(new Error("spawn edge-tts ENOENT"), { code: "ENOENT" }), status: null, signal: null };
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  return spy;
+}
+
+// edge 可用的 spawn 桩（只用于构造计划，不真跑）
+function presentEdgeSpawn() {
+  return function () {
+    return { status: 0, stdout: "", stderr: "" };
+  };
+}
+
+function captureStderr(fn) {
+  const chunks = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = function (chunk) {
+    chunks.push(String(chunk));
+    return true;
+  };
+  try {
+    return { value: fn(), stderr: () => chunks.join("") };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+test("edge：--rate 映射成 edge 的百分比参数（-10→-50%，0→+0%，10→+50%）", () => {
+  assert.equal(edgeRateArg(-10), "-50%");
+  assert.equal(edgeRateArg(-1), "-5%");
+  assert.equal(edgeRateArg(0), "+0%");
+  assert.equal(edgeRateArg(1), "+5%");
+  assert.equal(edgeRateArg(10), "+50%");
+  // 越界与非法值一律夹到合法区间，绝不产出裸数字（edge 只认带符号百分比）
+  assert.equal(edgeRateArg(99), "+50%");
+  assert.equal(edgeRateArg(-99), "-50%");
+  assert.equal(edgeRateArg(Number.NaN), "+0%");
+  assert.equal(edgeRateArg(undefined), "+0%");
+});
+
+test("edge：--voice 支持全名/短名/未知值，未给时用默认 Xiaoxiao", () => {
+  assert.equal(resolveEdgeVoice(undefined), "zh-CN-XiaoxiaoNeural");
+  assert.equal(resolveEdgeVoice(""), "zh-CN-XiaoxiaoNeural");
+  assert.equal(resolveEdgeVoice("zh-CN-YunxiNeural"), "zh-CN-YunxiNeural");
+  assert.equal(resolveEdgeVoice("yunxi"), "zh-CN-YunxiNeural");
+  assert.equal(resolveEdgeVoice("xiaoxiao"), "zh-CN-XiaoxiaoNeural");
+  assert.equal(resolveEdgeVoice("Yunyang"), "zh-CN-YunyangNeural");
+  // 未知值原样透传，交给 edge-tts 自己报错，不静默换成默认音色
+  assert.equal(resolveEdgeVoice("nosuch"), "nosuch");
+});
+
+test("speak --dry-run：edge 默认引擎带上 voice/rate/wav，产物路径按块号命名", () => {
+  const plan = buildSpeakPlan("【用户】你好。世界。", { rate: 3, voice: "yunxi", wav: path.join(TMP, "edge-out.wav"), spawn: presentEdgeSpawn() });
+  assert.equal(plan.engine, "edge", "未指定 --engine 时应默认 edge");
+  assert.equal(plan.voice, "zh-CN-YunxiNeural");
+  assert.equal(plan.rateArg, "+15%");
+  assert.equal(plan.wav, path.join(TMP, "edge-out.wav"), "plan.wav 必须按 --wav 设置（否则主流程不出声也不落盘）");
+  // 分块目录固定在 os.tmpdir()/read-aloud-edge（不随 --wav 漂移到别处）
+  assert.equal(plan.dir, path.join(os.tmpdir(), "read-aloud-edge"));
+  assert.equal(plan.commands.length, 2);
+  const args = plan.commands[0].args;
+  assert.equal(args[0], "--text");
+  assert.ok(args.indexOf("--voice") >= 0, "命令必须显式带音色");
+  assert.equal(args[args.indexOf("--voice") + 1], "zh-CN-YunxiNeural");
+  assert.ok(args.indexOf("--rate=+15%") >= 0, "语速必须用 edge 的 =百分比 形态");
+  assert.ok(args.indexOf("--write-media") >= 0);
+  assert.match(plan.commands[0].out, /part001\.mp3$/);
+  assert.match(plan.commands[1].out, /part002\.mp3$/);
+  assert.ok(plan.commands[0].out.indexOf(plan.dir) === 0, "产物必须落在 plan.dir 下");
+  // 第二块的 out 与命令里 --write-media 的值必须一致（否则收不到产物）
+  assert.equal(plan.commands[1].out, plan.commands[1].args[plan.commands[1].args.indexOf("--write-media") + 1]);
+  const printed = printPlan(plan);
+  assert.match(printed, /engine=edge/);
+  assert.match(printed, /voice=zh-CN-YunxiNeural/);
+  assert.match(printed, /--rate=\+15%/);
+  assert.match(printed, /--wav/);
+  assert.match(printed, /转 44\.1k 单声道 wav/);
+  // 无 --wav 时计划里要说清「会经 SoundPlayer 真出声」（不是只留 mp3 不出声）
+  const playPlan = buildSpeakPlan("【用户】你好。", { rate: 0, spawn: presentEdgeSpawn() });
+  assert.equal(playPlan.wav, null);
+  assert.match(printPlan(playPlan), /SoundPlayer 直接发声/);
+});
+
+test("speak：默认引擎 edge 不可用（ENOENT）时回落 sapi 并在 stderr 提示", () => {
+  const outcome = captureStderr(() => buildSpeakPlan("【用户】你好。", { rate: 0, spawn: missingEdgeSpawn() }));
+  assert.equal(outcome.value.engine, "sapi", "edge 不可用时应回落离线 sapi");
+  assert.match(outcome.stderr(), /edge 不可用/);
+  assert.match(outcome.stderr(), /已回落离线 sapi/);
+  // 显式 --engine edge 不回落（点名要神经音色，不能偷偷降级成机械音）
+  assert.throws(
+    () => buildSpeakPlan("【用户】你好。", { engine: "edge", rate: 0, spawn: missingEdgeSpawn() }),
+    /未检测到 edge-tts/
+  );
+  // 显式 --engine sapi 根本不探测 edge，也就不可能有回落提示
+  const sapi = captureStderr(() => buildSpeakPlan("【用户】你好。", { engine: "sapi", rate: 0 }));
+  assert.equal(sapi.value.engine, "sapi");
+  assert.ok(sapi.stderr().indexOf("回落") < 0, "显式 sapi 不应出现回落提示");
+});
+
+test("speak：非 edge 可用性错误不触发回落（fail-closed 不被放宽成 fail-open）", () => {
+  // 未知引擎仍是硬错误
+  assert.throws(() => buildSpeakPlan("【用户】你好。", { engine: "nope", spawn: missingEdgeSpawn() }), /未知引擎/);
+  // minimax 入口缺失也是硬错误（与 edge 无关，不受回落影响）
+  assert.throws(() => buildSpeakPlan("【用户】你好。", { engine: "minimax", llm: path.join(TMP, "no-such-llm.mjs") }), /找不到 local-ai 入口/);
+  // 只有带 engineUnavailable 标记的错误才被认定为「引擎可用性/网络」问题
+  assert.equal(isEdgeUnavailable(new Error("任意错误")), false);
+  assert.equal(isEdgeUnavailable(null), false);
+});
+
+test("edge：--list-voices 解析只留 zh-CN，并认出默认/推荐音色", () => {
+  assert.equal(listEdgeVoices(missingEdgeSpawn()), null, "edge 不可用时应返回 null 而不是抛错");
+  const table = [
+    "Name                               Gender    ContentCategories      VoicePersonalities",
+    "---------------------------------  --------  ---------------------  --------------------------------------",
+    "en-US-AriaNeural                   Female    News, Novel            Positive, Confident",
+    "zh-CN-XiaoxiaoNeural               Female    News, Novel            Warm",
+    "zh-CN-YunxiNeural                  Male      Novel                  Lively, Sunshine",
+    "zh-CN-liaoning-XiaobeiNeural       Female    Dialect                Humorous",
+  ].join("\n");
+  const parsed = parseEdgeVoiceTable(table);
+  assert.equal(parsed.length, 3);
+  assert.deepEqual(parsed[0], { name: "zh-CN-XiaoxiaoNeural", gender: "Female", personalities: "Warm" });
+  assert.equal(parsed[1].name, "zh-CN-YunxiNeural");
+  assert.equal(parsed[2].name, "zh-CN-liaoning-XiaobeiNeural");
+  // 非 zh-CN 行一条都不留
+  assert.ok(parsed.every((voice) => voice.name.indexOf("zh-CN-") === 0));
+});
+
+test("speak：playWav 的 spawn 失败 fail-closed（不把「没出声」报成播放完成）", () => {
+  // 播放走 PS7 + System.Media.SoundPlayer（只吃 wav）；PS7 缺失时 status 为 null，
+  // 不查 error 就会被当成"播完了"。与 runSapi 同款 fail-closed 写法。
+  const wav = path.join(TMP, "play.wav");
+  fs.writeFileSync(wav, makeWavBytes(8820, 44100, 8820));
+  assert.throws(() => playWav(wav, () => ({ error: new Error("spawn ENOENT"), status: null, signal: null })), /无法启动 PowerShell 7 播放/);
+  // 正常路径：spawn 收到 PS7 全路径 + -File 播放脚本 + -Path wav
+  const calls = [];
+  const ok = playWav(wav, (command, args) => {
+    calls.push({ command: command, args: args });
+    return { status: 0, signal: null };
+  });
+  assert.equal(ok.status, 0);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].command, /PowerShell\/7\/pwsh\.exe$/);
+  assert.ok(calls[0].args.indexOf("-File") >= 0);
+  assert.equal(calls[0].args[calls[0].args.indexOf("-Path") + 1], wav);
+  // 播放脚本必须用 PlaySync（异步 Play 会让进程立刻退出）并释放句柄
+  assert.match(PLAY_WAV_SCRIPT, /PlaySync\(\)/);
+  assert.match(PLAY_WAV_SCRIPT, /System\.Media\.SoundPlayer/);
+  assert.match(PLAY_WAV_SCRIPT, /Dispose\(\)/);
+});
+
 test("speak：拒绝未知引擎与空文本", () => {
   assert.throws(() => buildSpeakPlan("【用户】你好。", { engine: "nope" }), /未知引擎/);
   assert.throws(() => buildSpeakPlan("   ", { engine: "sapi" }), /没有可朗读内容/);
@@ -817,6 +980,7 @@ function makeElement(id, scrolled) {
 function makeFakeSynth(voices) {
   const spoken = [];
   const cancelled = [];
+  const utterances = [];
   let current = null;
   class FakeUtterance {
     constructor(text) {
@@ -832,6 +996,7 @@ function makeFakeSynth(voices) {
     getVoices: () => voices,
     speak: (utterance) => {
       spoken.push(utterance.text);
+      utterances.push(utterance);
       current = utterance;
       // 真实浏览器异步发 onend；用 setImmediate 发，守住 node:test 悬空坑
       setImmediate(() => {
@@ -851,7 +1016,7 @@ function makeFakeSynth(voices) {
     addEventListener: () => {},
     removeEventListener: () => {},
   };
-  return { spoken: spoken, cancelled: cancelled, api: api, Utterance: FakeUtterance };
+  return { spoken: spoken, cancelled: cancelled, utterances: utterances, api: api, Utterance: FakeUtterance };
 }
 
 function runWidgetScript(html, options) {
@@ -909,6 +1074,7 @@ function runWidgetScript(html, options) {
     scrolled: scrolled,
     spoken: synth ? synth.spoken : [],
     cancelled: synth ? synth.cancelled : [],
+    utterances: synth ? synth.utterances : [],
     stateWrites: stateWrites,
     dispatchWindow: (type, event) => {
       for (const fn of windowListeners[type] || []) fn(event || { type: type });
@@ -1064,6 +1230,69 @@ test("widget 冒烟：无 speechSynthesis 时按钮禁用并给可见提示", ()
   assert.match(harness.registry.get("ra-status").textContent, /未检测到中文语音/);
   harness.registry.get("ra-speak").dispatch("click");
   assert.equal(harness.spoken.length, 0);
+});
+
+test("widget 冒烟：音色下拉存在、默认优先级、切换写入 widgetState", () => {
+  const html = smokeHtml();
+  // ① 下拉与标签都在片段里（拼装层，不依赖运行时）
+  assert.ok(html.indexOf('id="ra-voice"') >= 0, "应有音色下拉");
+  assert.ok(html.indexOf('id="ra-voice-label"') >= 0, "应有音色标签");
+  assert.match(html, /for="ra-voice"/);
+
+  // ② 默认音色优先级：Natural/Online/Xiaoxiao/Yunxi > Yaoyao/Huihui > 任意 zh
+  const mixed = runWidgetScript(html, {
+    voices: [
+      { name: "Microsoft David", lang: "en-US" },
+      { name: "Microsoft Yaoyao", lang: "zh-CN" },
+      { name: "Microsoft Huihui", lang: "zh-CN" },
+      { name: "Microsoft Xiaoxiao Online (Natural)", lang: "zh-CN" },
+    ],
+  });
+  assert.equal(mixed.registry.get("ra-voice").value, "Microsoft Xiaoxiao Online (Natural)", "应优先神经/在线音色");
+
+  const legacy = runWidgetScript(html, {
+    voices: [
+      { name: "Some Zh Voice", lang: "zh-CN" },
+      { name: "Microsoft Huihui", lang: "zh-CN" },
+    ],
+  });
+  assert.equal(legacy.registry.get("ra-voice").value, "Microsoft Huihui", "无神经音色时优先 Huihui/Yaoyao");
+
+  const anyZh = runWidgetScript(html, { voices: [{ name: "Microsoft David", lang: "en-US" }, { name: "Other Zh", lang: "zh-CN" }] });
+  assert.equal(anyZh.registry.get("ra-voice").value, "Other Zh", "最后兜底任意 zh 语音");
+
+  // 下拉只列 zh 语音（不把 en-US 拉进来）
+  assert.ok(String(mixed.registry.get("ra-voice").innerHTML).indexOf("Microsoft David") < 0, "下拉不应列非 zh 语音");
+
+  // ③ 切换即写入 widgetState（privateContent.voice）并生效到后续 utterance
+  const voiceSel = mixed.registry.get("ra-voice");
+  voiceSel.value = "Microsoft Yaoyao";
+  voiceSel.dispatch("change");
+  const lastWrite = mixed.stateWrites[mixed.stateWrites.length - 1];
+  assert.deepEqual(JSON.parse(JSON.stringify(lastWrite)), { modelContent: null, privateContent: { voice: "Microsoft Yaoyao" } });
+  mixed.registry.get("ra-speak").dispatch("click");
+  assert.equal(mixed.utterances.length, 1, "切换音色后点朗读应发声");
+  assert.equal(mixed.utterances[0].voice && mixed.utterances[0].voice.name, "Microsoft Yaoyao", "切换后的音色必须真的用上");
+
+  // ④ 加载时读回保存的音色（且不写）
+  const restored = runWidgetScript(html, {
+    voices: [{ name: "Microsoft Huihui", lang: "zh-CN" }, { name: "Microsoft Yunxi Online", lang: "zh-CN" }],
+    initialState: { modelContent: null, privateContent: { voice: "Microsoft Yunxi Online" } },
+  });
+  assert.equal(restored.registry.get("ra-voice").value, "Microsoft Yunxi Online", "应读回私有状态里的音色");
+  assert.equal(restored.stateWrites.length, 0, "加载时不得写");
+
+  // ⑤ 状态里的音色已不在候选表里 → 回落到默认优先级，不崩
+  const stale = runWidgetScript(html, {
+    voices: [{ name: "Microsoft Huihui", lang: "zh-CN" }],
+    initialState: { privateContent: { voice: "Gone Voice" } },
+  });
+  assert.equal(stale.registry.get("ra-voice").value, "Microsoft Huihui");
+
+  // ⑥ zcode:set_globals 事件只应用不写
+  restored.dispatchWindow("zcode:set_globals", { detail: { globals: { widgetState: { privateContent: { voice: "Microsoft Huihui" } } } } });
+  assert.equal(restored.registry.get("ra-voice").value, "Microsoft Huihui");
+  assert.equal(restored.stateWrites.length, 0, "状态事件不得触发写");
 });
 
 test("widget 冒烟：无中文语音时同样禁用", () => {

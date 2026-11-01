@@ -147,15 +147,16 @@ $ node read-aloud.mjs sessions
 ### `speak` — 无头朗读
 
 ```bash
-node read-aloud.mjs speak <文本文件> [--engine sapi|minimax|edge] [--voice 名字] [--rate -10..10] [--wav out.wav] [--dry-run] [--llm 路径]
+node read-aloud.mjs speak <文本文件> [--engine edge|sapi|minimax] [--voice 名字] [--rate -10..10] [--wav out.wav] [--dry-run] [--llm 路径]
 ```
 
 | 参数 | 说明 |
 | --- | --- |
-| `--engine` | `sapi`（默认）/ `minimax` / `edge` |
-| `--voice <子串>` | 子串匹配语音名；不传按 `Microsoft Huihui` → `Yaoyao` → `Kangkang` → 第一个 zh-CN |
-| `--rate <-10..10>` | SAPI 语速 |
+| `--engine` | `edge`（默认，在线神经音色，不可用时自动回落 `sapi` 并提示）/ `sapi`（离线）/ `minimax`（套餐内，消耗额度） |
+| `--voice <名字>` | edge 音色名（全名如 `zh-CN-YunxiNeural` 或短名如 `yunxi`）；sapi 为子串匹配（默认 `Microsoft Huihui` → `Yaoyao` → `Kangkang` → 第一个 zh-CN） |
+| `--rate <-10..10>` | 语速；edge 映射成 `--rate=±X%`，sapi 为 SAPI Rate |
 | `--wav <路径>` | 只落盘不播音：每块一个 wav，ffmpeg concat 合并 |
+| （不给 --wav） | 直接出声（edge 经 ffmpeg 转 wav 后 PlaySync 播放；sapi 直调 System.Speech）；Ctrl+C 可中断 |
 | `--dry-run` | 只打印将执行的命令/参数，不发声 |
 | `--llm <路径>` | `minimax` 引擎的 TTS 包装脚本入口（默认尝试 `~/.zcode/skills/local-ai/llm.mjs`，可指向任意 OpenAI 兼容的等效脚本） |
 
@@ -185,21 +186,22 @@ node read-aloud.mjs widget <文本文件> (--out <文件> | --vizdir <目录> [-
 根节点唯一 id + `getElementById` 选取、禁 fetch/XHR/WebSocket、<1MB、主题变量 + 宿主 utility 类、
 lucide `data-lucide` 图标（无内联 SVG）、内联脚本 vm-safe。
 
-### `voices` — 列 SAPI 语音
+### `voices` — 列语音
 
 ```bash
 node read-aloud.mjs voices
 ```
 
-标注 zh-CN，并说明与浏览器 `speechSynthesis` 语音表的差异（见下节）。
+先列 SAPI 已装语音（标注 zh-CN），再列 edge-tts 在线神经音色（标注默认/推荐）；
+并说明与浏览器 `speechSynthesis` 语音表的差异（见下节）。
 
 ## 引擎矩阵
 
 | 引擎 | 依赖 | 成本 | 说明 |
 | --- | --- | --- | --- |
-| `sapi` | Windows `System.Speech`（PowerShell 7 全路径调用） | 离线零成本 | **默认**。Node 侧分块 → UTF-8 无 BOM 文件 → PS7 `Get-Content -Raw -Encoding utf8` 读 → 逐块 `Speak()` |
-| `minimax` | MiniMax 订阅 + TTS 包装脚本（默认尝试 `~/.zcode/skills/local-ai/llm.mjs`，`--llm` 可指定任意 OpenAI 兼容等效脚本） | 取决于所用订阅 | 提质可选项，须显式 `--engine minimax` |
-| `edge` | `edge-tts` CLI（`pip install edge-tts`） | 免费需联网 | 未安装则退出码 2 并给安装提示 |
+| `edge` | `edge-tts` CLI（`pip install edge-tts`） | 免费需联网 | **默认**。中文神经音色（晓晓/云希/云扬等 8 个）；不可用时自动回落 `sapi` |
+| `sapi` | Windows `System.Speech`（PowerShell 7 全路径调用） | 离线零成本 | Node 侧分块 → UTF-8 无 BOM 文件 → PS7 `Get-Content -Raw -Encoding utf8` 读 → 逐块 `Speak()` |
+| `minimax` | MiniMax 订阅 + TTS 包装脚本（默认尝试 `~/.zcode/skills/local-ai/llm.mjs`，`--llm` 可指定任意 OpenAI 兼容等效脚本） | 取决于所用订阅 | 提质可选项，须显式 `--engine minimax`（**消耗订阅额度**） |
 
 ## 已知坑位（实测踩过的）
 
@@ -207,8 +209,8 @@ node read-aloud.mjs voices
 | --- | --- | --- |
 | **widget 文件名前缀** | `--vizdir <目录>` 的产物名是 `read-aloud-<title>.html`，不是 `<title>.html` | 想要 `read-aloud-context.html` 就传 `--title context`（默认 title 已经是 `context`，但显式写更省心）；`--out` 则是原样文件名，不加前缀 |
 | **PS7 必须全路径** | 用短名 `pwsh` 会解析到 WindowsApps 的应用别名桩（85 字节），**静默失败**（计划任务里尤其容易踩） | 一律用 `C:/Program Files/PowerShell/7/pwsh.exe`（CLI 里已硬编码这个全路径） |
-| **`minimax` 消耗额度** | `--engine minimax` 走 local-ai 的 `llm.mjs tts`，属**套餐内**调用，但**会消耗订阅额度** | 默认引擎是离线零成本的 `sapi`；只在确实需要提质时显式 `--engine minimax` |
-| **`edge` 未装即降级** | 本机没装 `edge-tts` | 调 `--engine edge` 直接退出码 2 并给安装提示（`pip install edge-tts`）；不影响默认 `sapi` |
+| **`minimax` 消耗额度** | `--engine minimax` 走 local-ai 的 `llm.mjs tts`，属**套餐内**调用，但**会消耗订阅额度** | 默认引擎是在线神经音色 `edge`；只在确实需要提质时显式 `--engine minimax` |
+| **`edge` 不可用自动回落** | 未装 `edge-tts`（或联网失败）时 | 自动回落离线 `sapi` 并 stderr 提示（已装 edge-tts 时默认引擎就是它）；想强制离线用 `--engine sapi` |
 | **默认会话会取错** | 多窗口并行时，不带 `--session` 的 `dump` 取到另一个窗口的会话且不报错 | 用 `--session-by-text` 指纹定位或显式 `--session`，详见「会话定位」一节 |
 | **`speak` 只吃文件** | 没有直传文本 / stdin 的入口 | 正文先写进文件（**绝对 Windows 路径**，Git Bash 里的 `/tmp/...` 会被 MSYS 改写）再 `speak <文件>` |
 | **PowerShell 单元素数组退化** | `ConvertFrom-Json` 对**单元素** JSON 数组会摊平成标量，`$chunks[0]` 取到的是**第一个字符**——只念一个字，退出码还是 0（静默坏） | 解析 JSON 数组一律用 `@(...)` 包住（`$chunks = @(… \| ConvertFrom-Json)`），保证数组语义；本仓的 PS 脚本已按此写并有单测回归 |
@@ -242,8 +244,8 @@ PS7 侧 `Get-Content -Raw -Encoding utf8` 读取。
 
 同一套 Windows 语音在不同暴露面的可见数量不同：SAPI 面（`System.Speech`）通常能看到全部安装的
 zh-CN 语音（含 `Microsoft Huihui Desktop` 这类变体），而无头 Chrome 的 `speechSynthesis` 只暴露其中
-一部分（实测 3 个 zh-CN）。片段走浏览器 `speechSynthesis`，所以可选语音比 CLI 的 `sapi` 引擎少；
-CLI 的 `sapi` 引擎直调 `System.Speech`，可用全部 SAPI 面语音。
+一部分（实测 3 个 zh-CN）。片段走浏览器 `speechSynthesis`，**无法联网，只能用系统已装语音**（质量有限）；
+想要神经级音色请走 CLI 的默认引擎 `edge`（`pip install edge-tts` 即可，中文 8 音色，`--voice` 可换）。
 
 ## 工作原理：dump 的合成消息过滤
 

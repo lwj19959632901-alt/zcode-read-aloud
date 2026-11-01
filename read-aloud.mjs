@@ -6,7 +6,7 @@
 //            会话定位：--session <id> 显式指定 / --session-by-text <指纹> 文本指纹定位（互斥）；
 //            指纹只认真实用户消息（role=user + type=text + 非合成注入）；
 //            都不给才走默认解析（最近更新的主会话，多窗口并行时会取错，故只在明确知道时用）
-//   speak    无头朗读（引擎 sapi 默认 / minimax / edge；--dry-run 只打印命令）
+//   speak    无头朗读（引擎 edge 默认，不可用时自动回落离线 sapi / minimax；--dry-run 只打印命令）
 //   widget   把 dump 文本生成内联 HTML 片段（ZCode Gen UI，宿主唯一受支持的 UI 面）
 //   voices   列 SAPI 语音（标注 zh-CN，并说明与浏览器语音表的差异）
 //   sessions 列最近会话（过滤子代理会话），便于选 --session
@@ -36,6 +36,23 @@ const SAPI_MAX_CHUNK = 120; // SAPI 单块上限（超长走二次切分）
 const MINIMAX_MAX_CHUNK = 3000; // llm.mjs tts 的位置参数上限（Windows 命令行安全区）
 const WIDGET_MAX_SENTENCE = 200; // 片段里单句展示上限
 const SAPI_VOICE_PREFERENCE = ["Microsoft Huihui", "Yaoyao", "Kangkang"];
+// 默认引擎：edge（神经网络音色，需联网）。edge-tts 不可用或合成失败时自动回落离线 sapi。
+const DEFAULT_ENGINE = "edge";
+const EDGE_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural";
+const EDGE_RATE_STEP = 5; // --rate -10..10 → edge 的百分比参数：-10→-50%，0→+0%，10→+50%
+const EDGE_RECOMMENDED_VOICES = ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-YunyangNeural"];
+// 已知 zh-CN 音色表：--voice 只给短名（如 yunxi）时据此补全成全名；给全名则原样透传。
+const EDGE_ZH_VOICES = [
+  "zh-CN-XiaoxiaoNeural",
+  "zh-CN-XiaoyiNeural",
+  "zh-CN-YunjianNeural",
+  "zh-CN-YunxiNeural",
+  "zh-CN-YunxiaNeural",
+  "zh-CN-YunyangNeural",
+  "zh-CN-liaoning-XiaobeiNeural",
+  "zh-CN-shaanxi-XiaoniNeural",
+];
+const EDGE_PARTS_DIRNAME = "read-aloud-edge";
 const SESSION_TEXT_SEARCH_LIMIT = 10; // --session-by-text 默认在最近 10 个主会话里找指纹
 const PS7 = "C:/Program Files/PowerShell/7/pwsh.exe";
 const LOCAL_AI_LLM = path.join(os.homedir(), ".zcode", "skills", "local-ai", "llm.mjs");
@@ -603,6 +620,65 @@ function ffmpegConcatWav(parts, target) {
   return target;
 }
 
+// mp3 分块 → 单条 44.1k 单声道 wav。SoundPlayer 只吃 wav，所以 edge/minimax 的出声路径
+// 必须先转码（分块是 mp3，不能 -c copy 进 wav 容器）。
+function concatMp3ToWav(parts, target) {
+  if (!parts.length) throw new Error("没有可合并的分块音频");
+  const dir = path.dirname(target);
+  const list = path.join(dir, "read-aloud-concat.txt");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    list,
+    parts
+      .map(function (part) {
+        return "file '" + part.replace(/'/g, "'\\''") + "'";
+      })
+      .join("\n") + "\n",
+    "utf8"
+  );
+  const result = spawnSync(
+    "ffmpeg",
+    ["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", list, "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "1", target],
+    { encoding: "utf8" }
+  );
+  if (result.error) {
+    // 缺 ffmpeg 属「edge 播放链路不可用」而非参数错误：默认引擎下允许回落 sapi。
+    throw edgeUnavailable("找不到 ffmpeg（mp3→wav 播放需要它）: " + result.error.message);
+  }
+  if (result.status !== 0) throw new Error("ffmpeg 转码失败: " + String(result.stderr || "").trim());
+  return target;
+}
+
+// 播放脚本（PS7 + System.Media.SoundPlayer，只吃 wav）。参数经 -File 传入，避免引号坑。
+const PLAY_WAV_SCRIPT = [
+  "param([Parameter(Mandatory = $true)][string]$Path)",
+  "$ErrorActionPreference = \"Stop\"",
+  "$player = New-Object System.Media.SoundPlayer($Path)",
+  "try { $player.PlaySync() } finally { $player.Dispose() }",
+].join("\n");
+
+function playWav(wavPath, spawn) {
+  const spawnFn = typeof spawn === "function" ? spawn : spawnSync;
+  const tmpDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "read-aloud-play-"));
+  try {
+    const psFile = path.join(tmpDir, "play.ps1");
+    fs.writeFileSync(psFile, PLAY_WAV_SCRIPT, "utf8");
+    const result = spawnFn(PS7, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", psFile, "-Path", wavPath], {
+      stdio: "inherit",
+      encoding: "utf8",
+    });
+    // 与 runSapi 同款 fail-closed：spawn 失败时 status 为 null，不检查 error 会被判成"干净结束"。
+    if (result.error) throw new Error("无法启动 PowerShell 7 播放: " + result.error.message);
+    return result;
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* 临时目录清理失败不影响结果 */
+    }
+  }
+}
+
 // ---------------------------------------------------------------- speak 计划构造
 
 function sapiPlan(chunks, options) {
@@ -633,35 +709,99 @@ function minimaxPlan(chunks, options) {
     return {
       command: process.execPath,
       args: [llm, "tts", chunk, "--out", path.join(dir, "part" + String(index + 1).padStart(3, "0") + ".mp3")],
+      out: path.join(dir, "part" + String(index + 1).padStart(3, "0") + ".mp3"),
     };
   });
   return { engine: "minimax", chunks: chunks, commands: commands, dir: dir, wav: options.wav || null };
 }
 
-function edgePlan(chunks, options) {
-  const probe = spawnSync("edge-tts", ["--version"], { encoding: "utf8" });
+// edge-tts 可用性探测：spawn 失败（典型是 ENOENT，未安装）即视为「引擎不可用」。
+// 只有这类错误允许回落 sapi；其它错误（缺 ffmpeg、参数写错等）照旧抛，保持 fail-closed。
+function isEdgeUnavailable(err) {
+  return !!err && err.engineUnavailable === true;
+}
+
+function edgeUnavailable(message) {
+  const err = new Error(message);
+  err.engineUnavailable = true;
+  return err;
+}
+
+function probeEdge(spawn) {
+  const spawnFn = typeof spawn === "function" ? spawn : spawnSync;
+  const probe = spawnFn("edge-tts", ["--version"], { encoding: "utf8" });
   if (probe.error) {
-    die("未检测到 edge-tts CLI（" + probe.error.message + "）。安装：pip install edge-tts；本引擎为可选提质，默认 sapi 离线可用", 2);
+    throw edgeUnavailable("未检测到 edge-tts CLI（" + probe.error.message + "）。安装：pip install edge-tts");
   }
+  return true;
+}
+
+// --rate -10..10 → edge 的百分比参数：-10→-50%，0→+0%，10→+50%
+function edgeRateArg(rate) {
+  const numeric = Number(rate);
+  const value = Number.isFinite(numeric) ? Math.max(-10, Math.min(10, Math.round(numeric))) : 0;
+  const pct = value * EDGE_RATE_STEP;
+  return (pct >= 0 ? "+" : "") + pct + "%";
+}
+
+// --voice 可给全名（zh-CN-YunxiNeural）也可给短名（yunxi / Xiaoxiao）；
+// 未知值原样透传，让 edge-tts 自己报「音色不存在」，不静默换成默认音色。
+function resolveEdgeVoice(hint) {
+  const text = String(hint == null ? "" : hint).trim();
+  if (!text) return EDGE_DEFAULT_VOICE;
+  if (/^zh-/i.test(text)) return text;
+  const lower = text.toLowerCase();
+  const hit = EDGE_ZH_VOICES.filter(function (name) {
+    return name.toLowerCase().indexOf(lower) >= 0;
+  });
+  return hit.length ? hit[0] : text;
+}
+
+function edgePlan(chunks, options, spawn) {
+  probeEdge(spawn);
+  const voice = resolveEdgeVoice(options.voice);
+  const rateArg = edgeRateArg(options.rate);
+  const dir = path.join(os.tmpdir(), EDGE_PARTS_DIRNAME);
   const commands = chunks.map(function (chunk, index) {
+    const mp3 = path.join(dir, "part" + String(index + 1).padStart(3, "0") + ".mp3");
     return {
       command: "edge-tts",
-      args: ["--text", chunk, "--write-media", path.join(os.tmpdir(), "read-aloud-edge", "part" + String(index + 1).padStart(3, "0") + ".mp3")],
+      args: ["--text", chunk, "--voice", voice, "--rate=" + rateArg, "--write-media", mp3],
+      out: mp3,
     };
   });
-  return { engine: "edge", chunks: chunks, commands: commands };
+  return {
+    engine: "edge",
+    chunks: chunks,
+    voice: voice,
+    rate: options.rate,
+    rateArg: rateArg,
+    commands: commands,
+    dir: dir,
+    wav: options.wav || null,
+  };
 }
 
 function buildSpeakPlan(text, options) {
   const messages = parseDump(text);
-  const engine = options.engine || "sapi";
-  const maxLen = engine === "minimax" ? MINIMAX_MAX_CHUNK : SAPI_MAX_CHUNK;
+  const requested = options.engine || DEFAULT_ENGINE;
+  if (requested !== "sapi" && requested !== "minimax" && requested !== "edge") {
+    throw new Error("未知引擎: " + requested + "（可选 sapi / minimax / edge）");
+  }
+  const maxLen = requested === "minimax" ? MINIMAX_MAX_CHUNK : SAPI_MAX_CHUNK;
   const chunks = buildSpeechChunks(messages, maxLen);
   if (!chunks.length) throw new Error("输入文本没有可朗读内容");
-  if (engine === "sapi") return sapiPlan(chunks, options);
-  if (engine === "minimax") return minimaxPlan(chunks, options);
-  if (engine === "edge") return edgePlan(chunks, options);
-  throw new Error("未知引擎: " + engine + "（可选 sapi / minimax / edge）");
+  if (requested === "sapi") return sapiPlan(chunks, options);
+  if (requested === "minimax") return minimaxPlan(chunks, options);
+  try {
+    return edgePlan(chunks, options, options.spawn);
+  } catch (err) {
+    // 回落只对「默认自动选 edge」生效；显式 --engine edge 仍 fail-closed
+    // （用户点名要神经音色，不能偷偷降级成机械音）。
+    if (options.engine !== undefined || !isEdgeUnavailable(err)) throw err;
+    process.stderr.write("read-aloud: edge 不可用（" + err.message + "），已回落离线 sapi 引擎\n");
+    return sapiPlan(chunks, options);
+  }
 }
 
 function printPlan(plan) {
@@ -677,6 +817,10 @@ function printPlan(plan) {
       lines.push("[dry-run] 无 --wav：直接发声（Ctrl+C 可中途停）");
     }
   } else {
+    if (plan.engine === "edge") {
+      lines.push("[dry-run] voice=" + plan.voice + " rate=" + plan.rate + " → --rate=" + plan.rateArg);
+      lines.push("[dry-run] 分块产物目录 " + plan.dir + (plan.wav ? "，--wav " + plan.wav + "（ffmpeg 转 44.1k 单声道 wav 后落盘）" : "，无 --wav：转 wav 后经 SoundPlayer 直接发声"));
+    }
     plan.commands.forEach(function (command, index) {
       const preview = String(plan.chunks[index] || "").slice(0, 24);
       lines.push("[dry-run] " + command.command + " " + command.args.map(quoteArg).join(" "));
@@ -767,9 +911,18 @@ function runCommandList(plan) {
   plan.commands.forEach(function (command, index) {
     process.stdout.write("[read-aloud] (" + (index + 1) + "/" + plan.commands.length + ") " + command.command + "\n");
     const result = spawnSync(command.command, command.args, { stdio: "inherit", encoding: "utf8" });
-    if (result.error) throw new Error("启动失败: " + command.command + " — " + result.error.message);
-    if (result.status !== 0) throw new Error("命令退出码 " + result.status + ": " + command.command);
-    const out = command.args[command.args.length - 1];
+    // edge-tts 的启动失败与退出码非 0 都属于「引擎可用性/网络」问题，标记后可回落 sapi；
+    // 其它引擎的错误保持原样抛出（fail-closed）。
+    const edge = plan.engine === "edge";
+    if (result.error) {
+      const message = "启动失败: " + command.command + " — " + result.error.message;
+      throw edge ? edgeUnavailable(message) : new Error(message);
+    }
+    if (result.status !== 0) {
+      const message = "命令退出码 " + result.status + ": " + command.command;
+      throw edge ? edgeUnavailable(message) : new Error(message);
+    }
+    const out = command.out || command.args[command.args.length - 1];
     if (out && fs.existsSync(out)) parts.push(out);
   });
   return parts;
@@ -797,6 +950,8 @@ const WIDGET_SCRIPT = `(function () {
   var stopBtn = document.getElementById("ra-stop");
   var rateLabel = document.getElementById("ra-rate-label");
   var rateSel = document.getElementById("ra-rate");
+  var voiceLabel = document.getElementById("ra-voice-label");
+  var voiceSel = document.getElementById("ra-voice");
   var statusEl = document.getElementById("ra-status");
   var hintEl = document.getElementById("ra-hint");
   var bar = document.getElementById("ra-progress-bar");
@@ -833,6 +988,9 @@ const WIDGET_SCRIPT = `(function () {
 
   var rate = 1;
   var voice = null;
+  var voiceName = "";
+  var voices = [];
+  var savedVoice = "";
   var pos = 0;
   var runId = 0;
   var state = "idle";
@@ -866,18 +1024,92 @@ const WIDGET_SCRIPT = `(function () {
     if (progress) progress.setAttribute("aria-valuenow", String(pct));
   }
 
-  function pickVoice() {
-    if (!synth || typeof synth.getVoices !== "function") return null;
-    var list = synth.getVoices() || [];
-    for (var i = 0; i < list.length; i++) {
-      var lang = String((list[i] && list[i].lang) || "").toLowerCase();
-      if (lang.indexOf("zh") === 0) return list[i];
+  // 音色优先级：名字带 Natural / Online / Xiaoxiao / Yunxi（神经或在线音色）
+  // > Yaoyao / Huihui（老式 zh-CN）> 任意 zh 语音。片段不能联网，只能用系统已装语音。
+  var VOICE_TIERS = [
+    ["natural", "online", "xiaoxiao", "yunxi"],
+    ["yaoyao", "huihui"],
+  ];
+
+  function zhVoices() {
+    if (!synth || typeof synth.getVoices !== "function") return [];
+    var all = synth.getVoices() || [];
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var item = all[i];
+      if (!item) continue;
+      var lang = String(item.lang || "").toLowerCase();
+      if (lang.indexOf("zh") === 0) out.push(item);
+    }
+    return out;
+  }
+
+  function voiceTier(item) {
+    var name = String((item && item.name) || "").toLowerCase();
+    for (var t = 0; t < VOICE_TIERS.length; t++) {
+      for (var k = 0; k < VOICE_TIERS[t].length; k++) {
+        if (name.indexOf(VOICE_TIERS[t][k]) >= 0) return t;
+      }
+    }
+    return VOICE_TIERS.length;
+  }
+
+  function findVoice(name) {
+    for (var i = 0; i < voices.length; i++) {
+      if (String(voices[i].name || "") === name) return voices[i];
     }
     return null;
   }
 
+  // 默认音色：取层级最优的第一个（同层保持浏览器给出的顺序）
+  function defaultVoice() {
+    var best = null;
+    var bestTier = 999;
+    for (var i = 0; i < voices.length; i++) {
+      var tier = voiceTier(voices[i]);
+      if (tier < bestTier) {
+        best = voices[i];
+        bestTier = tier;
+      }
+    }
+    return best;
+  }
+
+  function readVoice(saved) {
+    if (!saved || typeof saved !== "object") return "";
+    var priv = saved.privateContent;
+    if (!priv || typeof priv !== "object") return "";
+    var value = priv.voice;
+    return typeof value === "string" ? value : "";
+  }
+
+  function escapeOption(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // 下拉项用 innerHTML 一次性铺（不用 createElement：宿主沙箱与测试 fake DOM 都只保证最小 API）。
+  function fillVoiceOptions() {
+    if (!voiceSel) return;
+    var html = "";
+    for (var i = 0; i < voices.length; i++) {
+      var name = escapeOption(voices[i].name);
+      if (!name) continue;
+      html += "<option>" + name + "</option>";
+    }
+    voiceSel.innerHTML = html;
+  }
+
   function refreshVoices() {
-    voice = pickVoice();
+    voices = zhVoices();
+    fillVoiceOptions();
+    var hit = savedVoice ? findVoice(savedVoice) : null;
+    voice = hit || defaultVoice();
+    voiceName = voice ? String(voice.name || "") : "";
+    if (voiceSel) voiceSel.value = voiceName;
     var usable = !!voice && !!Utter && queue.length > 0;
     if (speakBtn) speakBtn.disabled = !usable;
     if (hintEl) hintEl.style.display = usable ? "none" : "";
@@ -1025,7 +1257,33 @@ const WIDGET_SCRIPT = `(function () {
     return null;
   }
 
+  function saveVoice() {
+    try {
+      if (window.zcode && typeof window.zcode.setWidgetState === "function") {
+        var pending = window.zcode.setWidgetState({ modelContent: null, privateContent: { voice: voiceName } });
+        if (pending && typeof pending.then === "function") {
+          pending.then(null, function () {});
+        }
+      }
+    } catch (err) {
+      /* 宿主未提供状态持久化时忽略 */
+    }
+  }
+
+  function applyVoice(saved) {
+    savedVoice = readVoice(saved);
+  }
+
+  function selectVoice(name) {
+    var hit = findVoice(name);
+    if (!hit) return;
+    voice = hit;
+    voiceName = String(hit.name || "");
+    savedVoice = voiceName; // 用户显式选过：后续 refreshVoices 不得再被默认优先级覆盖
+  }
+
   applyRate(hostState());
+  applyVoice(hostState());
   refreshVoices();
 
   if (speakBtn) speakBtn.addEventListener("click", startRun);
@@ -1040,12 +1298,22 @@ const WIDGET_SCRIPT = `(function () {
       restartCurrent();
     });
   }
+  if (voiceSel) {
+    voiceSel.addEventListener("change", function () {
+      selectVoice(voiceSel.value);
+      saveVoice();
+      restartCurrent();
+    });
+  }
   if (synth && typeof synth.addEventListener === "function") {
     synth.addEventListener("voiceschanged", refreshVoices);
   }
   window.addEventListener("zcode:set_globals", function (event) {
     var globals = event && event.detail ? event.detail.globals : null;
-    applyRate(globals ? globals.widgetState : null);
+    var next = globals ? globals.widgetState : null;
+    applyRate(next);
+    applyVoice(next);
+    refreshVoices();
   });
 })();`;
 
@@ -1089,6 +1357,9 @@ function buildWidgetFragment(messages) {
     <button type="button" class="btn btn-secondary btn-sm" id="ra-stop" data-tooltip="停止朗读" style="display:none">
       <i data-lucide="square" aria-hidden="true"></i>停止
     </button>
+    <label class="form-label" id="ra-voice-label" for="ra-voice">音色
+      <select class="form-select form-select-xs" id="ra-voice"></select>
+    </label>
     <label class="form-label" id="ra-rate-label" for="ra-rate" style="display:none">倍速
       <select class="form-select form-select-xs" id="ra-rate">
         <option value="0.5">0.5×</option>
@@ -1173,6 +1444,37 @@ function dumpSummary(sessionId, usedMessages, totalMessages, blocks, chars, trun
   );
 }
 
+// sapi 走 PowerShell 内联脚本；--wav 时只落盘、不播音（SetOutputToWaveFile 语义）。
+function runSapiPlan(plan) {
+  const outcome = runSapi(plan);
+  if (outcome.wav) {
+    process.stdout.write("speak: sapi 已合成 " + outcome.parts + " 块 → " + outcome.wav + "（" + (outcome.seconds || 0).toFixed(2) + " 秒）\n");
+  } else if (outcome.interrupted) {
+    process.stdout.write("speak: 已中断\n");
+  } else {
+    process.stdout.write("speak: sapi 朗读完成\n");
+  }
+}
+
+// edge / minimax：逐块合成 mp3 → ffmpeg 转 44.1k 单声道 wav → 落盘或 SoundPlayer 出声。
+function runMp3Plan(plan) {
+  const parts = runCommandList(plan);
+  const label = plan.engine + (plan.voice ? "（" + plan.voice + "）" : "");
+  if (!parts.length) throw new Error(plan.engine + " 没有产出任何音频分块（" + plan.commands.length + " 块）");
+  const target = plan.wav || path.join(plan.dir || path.join(os.tmpdir(), "read-aloud-" + plan.engine), "play.wav");
+  concatMp3ToWav(parts, target);
+  const info = readWavInfo(target) || { seconds: ffprobeDuration(target) };
+  const seconds = info && typeof info.seconds === "number" ? info.seconds : null;
+  const secText = seconds == null ? "?" : seconds.toFixed(2);
+  if (plan.wav) {
+    process.stdout.write("speak: " + label + " 已合成 " + parts.length + " 块 → " + target + "（" + secText + " 秒）\n");
+    return;
+  }
+  process.stdout.write("speak: " + label + " 共 " + parts.length + " 块（" + secText + " 秒），正在播放（Ctrl+C 可中断）\n");
+  playWav(target);
+  process.stdout.write("speak: " + label + " 播放完成\n");
+}
+
 function cmdSpeak(positional, options) {
   const file = positional[0];
   if (!file) die("用法: node read-aloud.mjs speak <dump文本文件> [--engine sapi|minimax|edge] [--voice 名字] [--rate -10..10] [--wav out.wav] [--dry-run]");
@@ -1181,36 +1483,31 @@ function cmdSpeak(positional, options) {
   const voice = valueOption(options.voice, "voice");
   const rate = options.rate === undefined ? 0 : Number(valueOption(options.rate, "rate"));
   if (!Number.isInteger(rate) || rate < -10 || rate > 10) die("--rate 需要 -10..10 的整数");
-  const plan = buildSpeakPlan(text, {
+  const engineExplicit = options.engine !== undefined;
+  const speakOptions = {
     engine: options.engine,
     voice: voice,
     voiceHint: voice,
     rate: rate,
     wav: pathOption(options.wav, "wav"),
     llm: pathOption(options.llm, "llm"),
-  });
+  };
+  const plan = buildSpeakPlan(text, speakOptions);
   if (options["dry-run"]) {
     process.stdout.write(printPlan(plan) + "\n");
     return;
   }
   if (plan.engine === "sapi") {
-    const outcome = runSapi(plan);
-    if (outcome.wav) {
-      process.stdout.write("speak: sapi 已合成 " + outcome.parts + " 块 → " + outcome.wav + "（" + (outcome.seconds || 0).toFixed(2) + " 秒）\n");
-    } else if (outcome.interrupted) {
-      process.stdout.write("speak: 已中断\n");
-    } else {
-      process.stdout.write("speak: sapi 朗读完成\n");
-    }
+    runSapiPlan(plan);
     return;
   }
-  const parts = runCommandList(plan);
-  if (plan.wav && parts.length) {
-    ffmpegConcatWav(parts, plan.wav);
-    const info = readWavInfo(plan.wav);
-    process.stdout.write("speak: " + plan.engine + " 已合成 " + parts.length + " 块 → " + plan.wav + "（" + (info ? info.seconds.toFixed(2) : "?") + " 秒）\n");
-  } else {
-    process.stdout.write("speak: " + plan.engine + " 完成 " + parts.length + " 块（未指定 --wav，分块 mp3 已留在各自 --out）\n");
+  try {
+    runMp3Plan(plan);
+  } catch (err) {
+    // 只有「默认自动选 edge」且错误属引擎可用性/网络问题才回落；显式 --engine edge 与其它错误一律抛。
+    if (engineExplicit || plan.engine !== "edge" || !isEdgeUnavailable(err)) throw err;
+    process.stderr.write("read-aloud: edge 不可用（" + err.message + "），已回落离线 sapi 引擎\n");
+    runSapiPlan(buildSpeakPlan(text, Object.assign({}, speakOptions, { engine: "sapi" })));
   }
 }
 
@@ -1237,6 +1534,34 @@ function cmdWidget(positional, options) {
   process.stdout.write("widget: " + target + "（句数 " + (items ? items.length : 0) + "，片段 " + Buffer.byteLength(fragment, "utf8") + " 字节）\n");
 }
 
+// edge-tts 的中文音色表：解析 `--list-voices` 的表格输出（Name/Gender/…/Personalities），只留 zh-CN。
+function parseEdgeVoiceTable(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map(function (line) {
+      return line.trim();
+    })
+    .filter(function (line) {
+      return /^zh-CN-/i.test(line);
+    })
+    .map(function (line) {
+      const parts = line.split(/\s{2,}|\t+/).map(function (cell) {
+        return cell.trim();
+      }).filter(Boolean);
+      return { name: parts[0] || "", gender: parts[1] || "", personalities: parts.slice(3).join(" ") };
+    })
+    .filter(function (voice) {
+      return voice.name.length > 0;
+    });
+}
+
+function listEdgeVoices(spawn) {
+  const spawnFn = typeof spawn === "function" ? spawn : spawnSync;
+  const result = spawnFn("edge-tts", ["--list-voices"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  if (result.error || result.status !== 0) return null;
+  return parseEdgeVoiceTable(result.stdout);
+}
+
 function cmdVoices() {
   const voices = listSapiVoices();
   const zh = voices.filter(function (voice) {
@@ -1247,9 +1572,24 @@ function cmdVoices() {
     const mark = /^zh/i.test(voice.culture || "") ? "  ← zh-CN" : "";
     process.stdout.write("  " + voice.name + "  [" + voice.culture + "]  " + voice.gender + "/" + voice.age + mark + "\n");
   }
+  const edge = listEdgeVoices();
+  if (edge && edge.length) {
+    process.stdout.write("\nedge-tts 在线神经音色 " + edge.length + " 个（zh-CN，需联网；--voice 可用短名，如 yunxi）：\n");
+    for (const voice of edge) {
+      const marks = [];
+      if (voice.name === EDGE_DEFAULT_VOICE) marks.push("默认");
+      if (EDGE_RECOMMENDED_VOICES.indexOf(voice.name) >= 0) marks.push("推荐");
+      const suffix = marks.length ? "  ← " + marks.join(" / ") : "";
+      process.stdout.write("  " + voice.name + "  " + voice.gender + (voice.personalities ? "  " + voice.personalities : "") + suffix + "\n");
+    }
+    process.stdout.write("  提示：edge 需联网；默认引擎就是 edge，不可用时自动回落离线 sapi（--engine sapi 可强制离线）。\n");
+  } else {
+    process.stdout.write("\n（未检测到可用的 edge-tts：pip install edge-tts 后可列出在线神经音色；当前只有离线 sapi）\n");
+  }
   process.stdout.write("\n与浏览器 speechSynthesis 语音表的差异：\n");
-  process.stdout.write("  - 片段（widget）走浏览器 speechSynthesis，实测无头 Chrome 只有 3 个 zh-CN，且没有 \"Microsoft Huihui Desktop\" 这个变体；\n");
-  process.stdout.write("  - 本 CLI 的 sapi 引擎直调 System.Speech，可用全部 " + zh.length + " 个 zh-CN；两者是同一套 Windows 语音的不同暴露面。\n");
+  process.stdout.write("  - 片段（widget）走浏览器 speechSynthesis，无法联网，只能用系统已装语音；实测无头 Chrome 只有 3 个 zh-CN，且没有 \"Microsoft Huihui Desktop\" 这个变体；\n");
+  process.stdout.write("  - 想要 edge 神经音色请用 CLI：node read-aloud.mjs speak <文件> --voice zh-CN-YunxiNeural；\n");
+  process.stdout.write("  - 本 CLI 的 sapi 引擎直调 System.Speech，可用全部 " + zh.length + " 个 zh-CN；三者是不同暴露面。\n");
 }
 
 async function cmdSessions(options) {
@@ -1322,22 +1662,32 @@ export {
   buildSpeechChunks,
   buildSpeakPlan,
   buildWidgetFragment,
+  concatMp3ToWav,
   defaultDbPath,
+  edgeRateArg,
   escapeHtml,
   extractMessages,
   findSessionsByText,
   formatDump,
+  isEdgeUnavailable,
+  listEdgeVoices,
   openDatabase,
   parseDump,
+  parseEdgeVoiceTable,
   parseJson,
   pickSapiVoice,
+  playWav,
+  PLAY_WAV_SCRIPT,
   printPlan,
   readTextMessages,
   mergeConsecutive,
   readWavInfo,
   replaceCodeBlocks,
+  resolveEdgeVoice,
   resolveSessionId,
   roleLabel,
+  runCommandList,
+  runMp3Plan,
   runSapi,
   splitSentences,
   WIDGET_ROOT_ID,
