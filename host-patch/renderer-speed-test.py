@@ -4,9 +4,10 @@
   1. 倍速按钮存在、紧随 🔊（直系子节点）、文案 1.0×、aria-label/title/type 正确
   2. 样式不撑高操作栏（18px / 11px / 透明背景 / padding 0 2px）
   3. 点击循环 1.0 → 1.25 → 1.5 → 2.0 → 0.75 → 1.0，每次文案 + localStorage 同步
-  4. ttsUrl() 的 rate 参数按倍速换算（+25% → rate=%2B25%25；0.75 → -25%25；1.0 → +0%）
+  4. ttsUrl() 的 rate 参数固定 +0%（合成统一原速；倍速由播放器 playbackRate 实现，
+     切速不重合成、不发新请求——server 路径另有 CDP 在线验收）
   5. 降级路径 speechSynthesis 的 u.rate 跟随倍速（0.1–10 夹紧）
-  6. 播放中改倍速：不中断，从下一块起生效
+  6. 播放中改倍速：不中断，下一块按新倍速合成（降级路径；server 路径切速即 playbackRate）
   7. 多回合倍速按钮文案全局同步；≠1.0 时 accent 色提示
   8. MutationObserver 补回被冲掉的倍速按钮；整栏 clone 重渲染后仍恰好 1 个
   9. __readaloudReload() 与整页 reload 后倍速从 localStorage 恢复
@@ -203,8 +204,7 @@ def main():
             check("初始倍速 1.0（localStorage 空）", base["rate"] == 1, base["rate"])
 
             # ---------- 2. 点击循环：文案 + localStorage + ttsUrl ----------
-            steps = [(1.25, "1.25×", "%2B25%25"), (1.5, "1.5×", "%2B50%25"),
-                     (2, "2.0×", "%2B100%25"), (0.75, "0.75×", "-25%25"), (1, "1.0×", "%2B0%25")]
+            steps = [(1.25, "1.25×"), (1.5, "1.5×"), (2, "2.0×"), (0.75, "0.75×"), (1, "1.0×")]
             labels, stored, urls, debug_rates = [], [], [], []
             for _ in range(5):
                 page.click('[data-turn="1"] button[data-readaloud-speed="1"]')
@@ -228,8 +228,8 @@ def main():
             check("localStorage['readaloud.rate'] 依次等于 1.25 / 1.5 / 2 / 0.75 / 1",
                   [float(x) for x in stored] == [s[0] for s in steps], stored)
             check("debug.getRate() 与点击序列一致", debug_rates == [s[0] for s in steps], debug_rates)
-            check("ttsUrl() 的 rate 参数按倍速换算正确",
-                  all(steps[i][2] in urls[i] for i in range(len(steps))),
+            check("ttsUrl() 的 rate 参数固定 +0%（不再随倍速换算，切速不重合成）",
+                  all("%2B0%25" in u for u in urls),
                   [u.split("&")[2] for u in urls])
 
             # ---------- 3. accent 提示 ----------

@@ -9,8 +9,11 @@
  *     最后才按 group-hover/assistant class 回退；插入前校验容器直系含动作按钮），
  *     clone「复制」按钮（样式零成本）→ 换喇叭图标 + aria-label="朗读" → 插在复制之后；
  *   - 喇叭后面再插一个倍速小按钮（data-readaloud-speed="1"）：点击循环
- *     1.0 → 1.25 → 1.5 → 2.0 → 0.75 → 1.0，存 localStorage["readaloud.rate"]，
- *     下一次取块（含正在播放的下一块）按新倍速合成；
+ *     1.0 → 1.25 → 1.5 → 2.0 → 0.75 → 1.0，存 localStorage["readaloud.rate"]；
+ *     倍速由播放器实现（audio.playbackRate，>1 加速 <1 减速，preservePitch 默认保留
+ *     音高）：播放中切速立即生效、进度连续、不发任何新的 /tts 请求，不再重合成；
+ *     每个新创建的 audio 元素初始也带当前倍速；服务端合成统一原速（/tts 固定
+ *     rate=+0%）；停止状态只改状态不启动播放；降级 speechSynthesis 路径仍用 u.rate；
  *   - 点击：只取 [class*="assistant-row"] [data-conversation-selectable] 的活节点 innerText
  *     （用户气泡也有 [data-conversation-selectable]，裸查会读错；clone 会让 innerText
  *     退化成 textContent、丢段落分隔）；
@@ -136,12 +139,6 @@
     } catch (e) {
       /* 存不进去只影响下次恢复，不影响本次播放 */
     }
-  }
-
-  /* 1.25 → "+25%"、0.75 → "-25%"、1 → "+0%"（loader 的 RATE_RE 只收 [+-]\d{1,3}%） */
-  function ratePercent(r) {
-    var pct = Math.round((Number(r) - 1) * 100);
-    return (pct >= 0 ? "+" : "") + pct + "%";
   }
 
   /* 1 → "1.0×"、1.25 → "1.25×"、1.5 → "1.5×"、0.75 → "0.75×" */
@@ -393,7 +390,19 @@
     state.rate = nextRate(state.rate);
     saveRate(state.rate);
     refreshSpeedButtons();
-    log("rate ->", rateLabel(state.rate), ratePercent(state.rate));
+    log("rate ->", rateLabel(state.rate), "(playbackRate)");
+    /* 播放器侧变速：正在播的块直接改 playbackRate——声音立即变速、进度连续、
+       绝不发新的 /tts 请求（旧实现重开 ttsUrl 重合成，要等好几秒才出声）。
+       每个新创建的 audio 元素在 playServerChunk 里也初始带当前倍速。
+       停止状态（current 为空）/ 首块返回前（c.audio 未创建）只改状态，不启动播放；
+       降级模式下一块仍用 speechSynthesis 的 u.rate。 */
+    if (current && !current.stopped && current.audio) {
+      try {
+        current.audio.playbackRate = state.rate;
+      } catch (e) {
+        /* ignore */
+      }
+    }
   }
 
   /* 倍速按钮插在喇叭之后；已有则只同步文案（不重建 DOM，避免 Observer 自激） */
@@ -648,12 +657,14 @@
 
   /* ------------------------------------------------------------ 播放 */
 
+  /* 合成统一原速 +0%：倍速由播放器 playbackRate 实现，切速不再重合成；
+     保留 rate 参数（loader 的 RATE_RE 只收 [+-]\d{1,3}%，缺省时也是 +0%）。 */
   function ttsUrl(chunk) {
     return (
       BASE +
       "/tts?t=" + encodeURIComponent(TOKEN) +
       "&voice=" + encodeURIComponent(CFG_VOICE) +
-      "&rate=" + encodeURIComponent(ratePercent(state.rate)) +
+      "&rate=" + encodeURIComponent("+0%") +
       "&text=" + encodeURIComponent(chunk)
     );
   }
@@ -687,7 +698,10 @@
   function finishPlayback() {
     var c = current;
     current = null;
-    if (c && c.btn) setBtnState(c.btn, "idle");
+    if (c) {
+      c.settleCurrent = null;
+      if (c.btn) setBtnState(c.btn, "idle");
+    }
   }
 
   function stopPlayback() {
@@ -695,6 +709,7 @@
     current = null;
     if (!c) return;
     c.stopped = true;
+    c.settleCurrent = null;
     if (c.audio) {
       try {
         c.audio.pause();
@@ -732,6 +747,9 @@
       c.chunkAt = Date.now();
       audio = new Audio(ttsUrl(c.chunks[c.idx]));
       audio.preload = "auto";
+      /* 新块初始即带当前倍速（>1 加速 <1 减速，0.75–2.0 全支持，
+         preservePitch 默认保留音高）：切速后新开的块也用新倍速。 */
+      audio.playbackRate = state.rate;
     } catch (e) {
       c.mode = "fallback";
       playFallbackChunk();
@@ -740,10 +758,15 @@
 
     c.audio = audio;
     var settled = false;
+    /* 本块音频的「当前句柄」：只认自己那块 audio（旧句柄清不掉新块），
+       块推进 / 停止 / 完成（advance、degrade、stopPlayback、finishPlayback）
+       时句柄一并作废。 */
+    c.settleCurrent = { audio: audio };
 
     function advance() {
       if (settled) return;
       settled = true;
+      if (c.settleCurrent && c.settleCurrent.audio === audio) c.settleCurrent = null;
       if (current !== c || c.stopped) return;
       c.audio = null;
       c.idx += 1;
@@ -753,6 +776,7 @@
     function degrade() {
       if (settled) return;
       settled = true;
+      if (c.settleCurrent && c.settleCurrent.audio === audio) c.settleCurrent = null;
       if (current !== c || c.stopped) return;
       var waited = c.chunkAt ? Date.now() - c.chunkAt : 0;
       log("audio failed, falling back to speechSynthesis");
@@ -1206,6 +1230,19 @@
     /* 倍速：只读当前值 + 实际会拼出的 URL（离线自检用，不改状态） */
     getRate: function () {
       return state.rate;
+    },
+    /* 播放会话快照（热验证用：播放中切倍速时看 playbackRate 生效 + 进度连续） */
+    getCurrent: function () {
+      if (!current) return null;
+      return {
+        idx: current.idx,
+        total: current.chunks.length,
+        mode: current.mode,
+        stopped: !!current.stopped,
+        hasAudio: !!current.audio,
+        playbackRate: current.audio ? current.audio.playbackRate : null,
+        currentTimeMs: current.audio ? Math.round(current.audio.currentTime * 1000) : null,
+      };
     },
     rateSteps: RATE_STEPS.slice(0),
     ttsUrl: function (chunk) {

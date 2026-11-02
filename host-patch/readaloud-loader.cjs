@@ -409,11 +409,14 @@ function streamTts(req, res, params) {
 
   const voice = sanitizeVoice(params.voice);
   const rate = sanitizeRate(params.rate);
+  // 带值的选项一律用 --opt=<值> 单参数形式：负向倍速（"-25%"）和以 "-" 开头的正文
+  // （如 "-项目"）若拆成 ["--text", "-项目"]，argparse 会当成未知选项，edge_tts 直接
+  // exit 2（桥回 502）。--voice 不用改：VOICE_RE 已限定首字符是字母。
   const args = pythonArgs([
     "-m", "edge_tts",
-    "--text", text,
+    "--text=" + text,
     "--voice", voice,
-    "--rate", rate,
+    "--rate=" + rate,
   ]);
 
   state.ttsActive += 1;

@@ -4,7 +4,11 @@
 点一下用 **edge-tts 神经音色**（默认 `zh-CN-XiaoxiaoNeural`）流式朗读这条回复，再点停止。
 
 > 🔊 右边的倍速小按钮：点击循环 `1.0× → 1.25× → 1.5× → 2.0× → 0.75×`，选择写进
-> `localStorage["readaloud.rate"]`，热重载 / 重启后自动恢复；正在播放时改倍速不中断，下一块起生效。
+> `localStorage["readaloud.rate"]`，热重载 / 重启后自动恢复；倍速是**播放器变速**
+> （`audio.playbackRate`）：播放中改倍速**立即生效**（0 延迟、进度连续、不发新的
+> `/tts` 请求，preservePitch 默认保留音高），不再重合成；每个新创建的 audio 元素
+> 初始也带当前倍速；服务端合成统一原速（`/tts` 固定 `rate=+0%`）；停止状态下只改
+> 设置、不启动播放；降级 `speechSynthesis` 路径仍按新的 `u.rate` 出下一块。
 
 > 这是「C 方案」：改宿主 `app.asar` 入口，追加一行 dynamic import。
 > A/B 方案（CLI + 技能 + MCP 侧栏面板）在仓库上层，不依赖本目录。
