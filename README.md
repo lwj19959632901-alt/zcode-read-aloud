@@ -8,6 +8,7 @@ read-aloud/
 ├── read-aloud.mjs        单文件 CLI + 片段生成器（dump / speak / widget / voices / sessions）
 ├── read-aloud.test.mjs   node:test 单测（35 条）
 ├── smoke_widget.py       Playwright + Chrome 真实浏览器冒烟
+├── host-patch/           可选：ZCode 桌面端 asar 补丁（消息操作栏朗读按钮）
 ├── docs/demo.png         演示截图（占位，随首个 Release 补充）
 ├── LICENSE               MIT
 └── README.md             本文件
@@ -100,8 +101,8 @@ node read-aloud.mjs dump [--session ID | --session-by-text 指纹] [--session-by
 ### 会话定位：指纹法 vs 显式 `--session`（**绝不依赖默认会话**）
 
 默认解析取的是「`time_updated` 最新的主会话」。**多窗口并行时它会静默取到另一个窗口的会话**——
-本机实测：当前对话在 `sess_6002fc29`，不带 `--session` 的 `dump` 取到的是并行窗口的
-`sess_2fe7a446`（llm-distill 会话），**不报错、不提示**。这类「取错会话」比报错更危险：
+本机实测：当前对话在 `sess_<当前窗口>`，不带 `--session` 的 `dump` 取到的是并行窗口的
+`sess_<并行窗口>`（llm-distill 会话），**不报错、不提示**。这类「取错会话」比报错更危险：
 朗读/渲染出来的是另一个窗口的内容。
 
 两种可靠定位法：
@@ -263,6 +264,18 @@ AI Agent 会话库里混着大量**非对话内容**：系统提示词、deferre
 三个判别式是「或」的关系、双层级生效，宁多滤不漏滤；`sessions` 子命令同理还会按会话 id 前缀
 排除 agent 内部派生会话（`sess_subagent_*` / `sess_dwf-*`），避免默认解析取错会话。
 
+## 宿主补丁（可选）
+
+`host-patch/` 是给 **ZCode 桌面端**用的 asar 补丁：往 `app.asar` 入口追加一行 dynamic import
+（主进程起本机 HTTP 桥），再把 🔊 按钮插到每条助手回复的消息操作栏里（流式 edge-tts，
+断网降级系统语音）。安装、卸载、排障与自检见 [`host-patch/README.md`](host-patch/README.md)。
+
+风险须知：
+
+- **官方升级会整包替换 `app.asar`**，注入行随之消失、按钮不见 —— 升级后重跑 `install.ps1` 即可；
+- 安装 / 卸载都要求**完全退出 ZCode**（含托盘/后台进程），工具检测到运行中会直接拒绝；
+- **仅适用于 Windows + ZCode 桌面端**；卸载只剥离注入行（strip-only），不会用旧备份覆盖 asar。
+
 ## 测试与验收
 
 ```bash
@@ -290,9 +303,9 @@ node read-aloud.mjs widget ctx.txt --out button.html
 ```bash
 # ① 造一个 18 字的单句（只有一块 → 走单元素数组那条路）
 #    路径必须写绝对 Windows 路径：Git Bash 里 $TEMP 是 /tmp（MSYS 路径），会被改写
-printf '【用户】这是一句用于验收的中文朗读测试文本。\n' > "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.txt"
+printf '【用户】这是一句用于验收的中文朗读测试文本。\n' > "C:/Users/<用户名>/AppData/Local/Temp/ra-single.txt"
 # ② 真实 PS7 合成到 wav（只落盘不播音）
-node read-aloud.mjs speak "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.txt" --wav "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.wav"
+node read-aloud.mjs speak "C:/Users/<用户名>/AppData/Local/Temp/ra-single.txt" --wav "C:/Users/<用户名>/AppData/Local/Temp/ra-single.wav"
 # ③ 看控制台：必须是完整句子，不能只有第一个字
 #    [1/1] 这是一句用于验收的中文朗读测试文本。
 #    speak: sapi 已合成 1 块 → …（4.36 秒）
@@ -301,7 +314,7 @@ node read-aloud.mjs speak "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.txt"
 wav 时长用 WAV 头算（`dataSize / byteRate`）或 `ffprobe -show_entries format=duration`：
 
 ```bash
-ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 "C:/Users/Nefelibata/AppData/Local/Temp/ra-single.wav"
+ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 "C:/Users/<用户名>/AppData/Local/Temp/ra-single.wav"
 ```
 
 实测基线（2026-11-01，PS 7 + `Microsoft Huihui Desktop`）：控制台 `[1/1] 这是一句用于验收的中文朗读测试文本。`，

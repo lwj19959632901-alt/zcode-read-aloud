@@ -3,3 +3,11 @@ tmp-smoke/
 *.wav
 node_modules/
 .mimosa/
+
+# 本地探针 / 演练产物
+tmp-probe/
+plugin-probe/
+marketplace-local/
+host-patch/state/
+*.pyc
+*.log
