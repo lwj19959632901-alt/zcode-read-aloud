@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>朗读</title>
+<style>
+  :root {
+    --ra-bg: var(--background, transparent);
+    --ra-fg: var(--foreground, #e6e6e6);
+    --ra-muted: var(--muted, #9aa0a6);
+    --ra-border: var(--border, #444);
+    --ra-accent: var(--accent, #4f46e5);
+    --ra-accent-fg: var(--accent-foreground, #fff);
+    --ra-danger: var(--destructive, #ef4444);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    color: var(--ra-fg);
+    background: var(--ra-bg);
+    padding: 10px 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    height: 100%;
+    min-height: 0;
+  }
+  #ra-title {
+    font-size: 15px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  #ra-status {
+    font-size: 12px;
+    color: var(--ra-muted);
+    font-weight: 400;
+  }
+  #ra-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  #ra-controls label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--ra-muted);
+  }
+  select, button {
+    font-size: 13px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--ra-border);
+    background: var(--ra-bg);
+    color: var(--ra-fg);
+    cursor: pointer;
+  }
+  select { max-width: 160px; }
+  button#ra-speak {
+    background: var(--ra-accent);
+    color: var(--ra-accent-fg);
+    border-color: var(--ra-accent);
+    font-weight: 500;
+  }
+  button#ra-speak:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  button#ra-stop {
+    border-color: var(--ra-danger);
+    color: var(--ra-danger);
+  }
+  #ra-progress {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--ra-border);
+    overflow: hidden;
+    width: 100%;
+  }
+  #ra-progress-bar {
+    height: 100%;
+    background: var(--ra-accent);
+    transition: width 0.2s;
+    width: 0%;
+  }
+  #ra-transcript {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--ra-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    line-height: 1.7;
+    min-height: 120px;
+  }
+  .ra-msg { margin: 0 0 8px; }
+  .ra-msg:last-child { margin-bottom: 0; }
+  .ra-role {
+    display: block;
+    font-size: 11px;
+    color: var(--ra-muted);
+    margin-bottom: 2px;
+    font-weight: 500;
+  }
+  .ra-sent {
+    border-radius: 3px;
+    padding: 1px 2px;
+  }
+  .ra-sent.is-read { color: var(--ra-muted); }
+  .ra-sent.is-active {
+    background: var(--ra-accent);
+    color: var(--ra-accent-fg);
+  }
+  #ra-hint {
+    font-size: 12px;
+    color: var(--ra-danger);
+    min-height: 16px;
+    line-height: 1.5;
+  }
+  #ra-session-note {
+    font-size: 11px;
+    color: var(--ra-muted);
+    min-height: 14px;
+  }
+</style>
+</head>
+<body>
+<div id="ra-title">
+  <span>朗读</span>
+  <span id="ra-status" role="status" aria-live="polite"></span>
+</div>
+<div id="ra-controls">
+  <label for="ra-voice">音色</label>
+  <select id="ra-voice" aria-label="音色"></select>
+  <label for="ra-rate">倍速</label>
+  <select id="ra-rate" aria-label="倍速">
+    <option value="0.5">0.5×</option>
+    <option value="0.75">0.75×</option>
+    <option value="1" selected>1×</option>
+    <option value="1.25">1.25×</option>
+    <option value="1.5">1.5×</option>
+    <option value="2">2×</option>
+  </select>
+  <button type="button" id="ra-speak" aria-pressed="false">朗读</button>
+  <button type="button" id="ra-stop">停止</button>
+</div>
+<div id="ra-progress" role="progressbar" aria-label="朗读进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+  <div id="ra-progress-bar"></div>
+</div>
+<div id="ra-transcript" aria-label="朗读转写区"></div>
+<div id="ra-session-note"></div>
+<div id="ra-hint"></div>
+<script>
+(function () {
+  "use strict";
+
+  // 8 音色硬编码（与 server EDGE_ZH_VOICES 完全一致，panel.test.mjs 断言防漂移）
+  var VOICE_LIST = [
+    { name: "zh-CN-XiaoxiaoNeural", label: "晓晓", gender: "女", style: "温暖" },
+    { name: "zh-CN-XiaoyiNeural", label: "晓伊", gender: "女", style: "温柔" },
+    { name: "zh-CN-YunjianNeural", label: "云健", gender: "男", style: "磁性" },
+    { name: "zh-CN-YunxiNeural", label: "云希", gender: "男", style: "阳光" },
+    { name: "zh-CN-YunxiaNeural", label: "云夏", gender: "男", style: "沉稳" },
+    { name: "zh-CN-YunyangNeural", label: "云扬", gender: "男", style: "专业" },
+    { name: "zh-CN-liaoning-XiaobeiNeural", label: "晓北", gender: "女", style: "东北口音" },
+    { name: "zh-CN-shaanxi-XiaoniNeural", label: "晓妮", gender: "女", style: "陕西口音" }
+  ];
+
+  // 倍速映射 → speak_session/speak_chunk 的 rate 参数（-10..10 标度）
+  // 0.5×→-10, 0.75×→-5, 1×→0, 1.25×→5, 1.5×→10, 2×→10（edge-tts 上限 +50%）
+  var RATE_MAP = {
+    "0.5": -10,
+    "0.75": -5,
+    "1": 0,
+    "1.25": 5,
+    "1.5": 10,
+    "2": 10
+  };
+
+  // 面板→host postMessage 协议（照 probe 实证）
+  var msgId = 0;
+  var pending = {};
+  var TIMEOUT_MS = 150000; // 预审 P1-2：服务端合成 timeout 120s，面板 150s
+
+  function callTool(name, args, meta) {
+    return new Promise(function (resolve, reject) {
+      var id = ++msgId;
+      var entry = { resolve: resolve, reject: reject, retries: 1 };
+      pending[id] = entry;
+      var timer = setTimeout(function () {
+        onTimeout(id, name, args, meta);
+      }, TIMEOUT_MS);
+      entry.timer = timer;
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        id: id,
+        method: "tools/call",
+        params: { name: name, arguments: args || {}, _meta: meta || {} }
+      }, "*");
+    });
+  }
+
+  // 超时后自动重试一次（服务端若已合成完则缓存命中秒回；重试仍超时才报错停止）
+  function onTimeout(id, name, args, meta) {
+    var entry = pending[id];
+    if (!entry) return;
+    if (entry.retries > 0) {
+      entry.retries--;
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(function () { onTimeout(id, name, args, meta); }, TIMEOUT_MS);
+      window.parent.postMessage({
+        jsonrpc: "2.0",
+        id: id,
+        method: "tools/call",
+        params: { name: name, arguments: args || {}, _meta: meta || {} }
+      }, "*");
+      return;
+    }
+    delete pending[id];
+    entry.reject(new Error("请求超时（已重试一次）: " + name));
+  }
+
+  window.addEventListener("message", function (event) {
+    var msg = event.data;
+    if (!msg || typeof msg !== "object") return;
+    // 忽略请求消息（有 method 字段）——standalone 页面里 window.parent===window，
+    // 自己的请求会回显，不能当响应匹配
+    if (msg.method) return;
+    var entry = pending[msg.id];
+    if (!entry) {
+      // 未匹配 id：可能是模型经命令触发的 speak_session/speak_chunk 结果
+      // host 转发到面板 surface → 驱动 UI（渲染/播放）
+      handleInbound(msg);
+      return;
+    }
+    clearTimeout(entry.timer);
+    delete pending[msg.id];
+    if (msg.error) entry.reject(new Error(msg.error.message || "RPC 错误"));
+    else entry.resolve(msg.result || {});
+  });
+
+  function handleInbound(msg) {
+    // 模型经命令触发的 speak_session 结果：渲染转写区 + 自动播放
+    // 只在面板已渲染且当前空闲时驱动
+    if (!msg.result) return;
+    var content = msg.result.content;
+    if (!content || !content[0]) return;
+    var payload;
+    try {
+      payload = JSON.parse(content[0].text || "{}");
+    } catch (e) {
+      return;
+    }
+    if (payload.ok && payload.requestId && payload.chunks) {
+      // 只有当前没有在途朗读时才自动播放（避免覆盖用户手动操作）
+      if (state === "idle" || state === "stopped") {
+        renderTranscript(payload.chunks, payload);
+        setRequest(payload);
+        state = "speaking";
+        currentRunId++;
+        setStatus("正在合成第 1 块…");
+        requestChunk(0);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- DOM 引用
+  var voiceSel = document.getElementById("ra-voice");
+  var rateSel = document.getElementById("ra-rate");
+  var speakBtn = document.getElementById("ra-speak");
+  var stopBtn = document.getElementById("ra-stop");
+  var statusEl = document.getElementById("ra-status");
+  var hintEl = document.getElementById("ra-hint");
+  var progressEl = document.getElementById("ra-progress");
+  var barEl = document.getElementById("ra-progress-bar");
+  var transcriptEl = document.getElementById("ra-transcript");
+  var sessionNoteEl = document.getElementById("ra-session-note");
+
+  // ---------------------------------------------------------------- 状态
+  var audio = null;
+  var currentRunId = 0;
+  var state = "idle"; // idle | speaking | stopped | done
+  var requestId = null;
+  var chunks = [];
+  var chunkEls = [];
+  var currentIndex = -1;
+  var selectedVoice = VOICE_LIST[0].name;
+  var selectedRateKey = "1";
+
+  function setStatus(text) {
+    if (statusEl) statusEl.textContent = text || "";
+  }
+  function setHint(text) {
+    if (hintEl) hintEl.textContent = text || "";
+  }
+  function setSessionNote(text) {
+    if (sessionNoteEl) sessionNoteEl.textContent = text || "";
+  }
+  function setProgress(index) {
+    var pct = chunks.length > 0 && index >= 0 ? Math.round((index / chunks.length) * 100) : 0;
+    if (barEl) barEl.style.width = pct + "%";
+    if (progressEl) progressEl.setAttribute("aria-valuenow", String(pct));
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function fillVoiceOptions() {
+    var html = "";
+    for (var i = 0; i < VOICE_LIST.length; i++) {
+      var v = VOICE_LIST[i];
+      html += '<option value="' + escapeHtml(v.name) + '">' + escapeHtml(v.label + "（" + v.gender + "·" + v.style + "）") + "</option>";
+    }
+    voiceSel.innerHTML = html;
+    voiceSel.value = selectedVoice;
+  }
+
+  function renderTranscript(chunkList, sessionPayload) {
+    transcriptEl.innerHTML = "";
+    chunkEls = [];
+    for (var i = 0; i < chunkList.length; i++) {
+      var c = chunkList[i];
+      var msgDiv = document.createElement("div");
+      msgDiv.className = "ra-msg";
+      var roleSpan = document.createElement("span");
+      roleSpan.className = "ra-role";
+      roleSpan.textContent = c.label || c.role || "文本";
+      msgDiv.appendChild(roleSpan);
+      var sentSpan = document.createElement("span");
+      sentSpan.className = "ra-sent";
+      sentSpan.id = "ra-sent-" + i;
+      sentSpan.textContent = c.text;
+      msgDiv.appendChild(sentSpan);
+      transcriptEl.appendChild(msgDiv);
+      chunkEls.push(sentSpan);
+    }
+    setProgress(-1);
+    // 会话身份透明化
+    if (sessionPayload && sessionPayload.sessionSource === "fallback-latest") {
+      setSessionNote("会话 " + (sessionPayload.sessionId || "?") + "（最近更新，host 未注入身份）");
+    } else if (sessionPayload && sessionPayload.sessionId) {
+      setSessionNote("会话 " + sessionPayload.sessionId);
+    } else {
+      setSessionNote("");
+    }
+  }
+
+  function setActive(index) {
+    for (var k = 0; k < chunkEls.length; k++) {
+      var el = chunkEls[k];
+      if (k === index) el.classList.add("is-active");
+      else el.classList.remove("is-active");
+      if (k < index) el.classList.add("is-read");
+      else el.classList.remove("is-read");
+    }
+    var current = chunkEls[index];
+    if (current && typeof current.scrollIntoView === "function") {
+      current.scrollIntoView({ block: "nearest" });
+    }
+    setProgress(index);
+  }
+
+  function setRequest(payload) {
+    requestId = payload.requestId;
+    chunks = payload.chunks;
+    selectedVoice = payload.voice || selectedVoice;
+    if (voiceSel) voiceSel.value = selectedVoice;
+    speakBtn.disabled = false;
+  }
+
+  // ---------------------------------------------------------------- 播放
+
+  function requestChunk(index, voiceOverride, rateOverride) {
+    var myRun = currentRunId;
+    var args = { requestId: requestId, index: index };
+    if (voiceOverride) args.voice = voiceOverride;
+    if (rateOverride !== undefined && rateOverride !== null) args.rate = rateOverride;
+    return callTool("speak_chunk", args, { ui: { surface: "read-aloud", visibility: ["app"] } })
+      .then(function (result) {
+        if (myRun !== currentRunId) return; // runId 失效：停止/重启后丢弃在途响应
+        var content = result.content;
+        if (!content || !content[0]) throw new Error("空响应");
+        var payload = JSON.parse(content[0].text);
+        if (!payload.ok) throw new Error(payload.error || "合成失败");
+        if (payload.voice) selectedVoice = payload.voice;
+        if (payload.rate !== undefined) {
+          // 回显 effective rate，但面板倍速映射保持原样
+        }
+        playDataUri(payload.dataUri, index, payload);
+      })
+      .catch(function (err) {
+        if (myRun !== currentRunId) return; // runId 失效：丢弃在途错误
+        if (state === "speaking" || state === "idle") {
+          setHint("合成失败: " + err.message);
+          setStatus("朗读启动失败");
+          state = "idle";
+          speakBtn.setAttribute("aria-pressed", "false");
+          speakBtn.disabled = false;
+        }
+      });
+  }
+
+  function finishRun() {
+    state = "done";
+    speakBtn.setAttribute("aria-pressed", "false");
+    speakBtn.disabled = false;
+    setProgress(chunks.length);
+    setStatus("朗读完成，共 " + chunks.length + " 块");
+  }
+
+  function playDataUri(dataUri, index, payload) {
+    if (!audio) {
+      audio = new Audio();
+      audio.addEventListener("ended", function () {
+        if (state !== "speaking") return;
+        currentIndex = currentIndex + 1;
+        if (currentIndex >= chunks.length) {
+          finishRun();
+        } else {
+          setStatus("正在合成第 " + (currentIndex + 1) + " 块…");
+          requestChunk(currentIndex);
+        }
+      });
+      audio.addEventListener("error", function () {
+        if (state !== "speaking") return;
+        setHint("音频播放失败: " + (audio.error ? audio.error.message : "未知错误"));
+        setStatus("朗读失败");
+        state = "idle";
+        speakBtn.setAttribute("aria-pressed", "false");
+        speakBtn.disabled = false;
+      });
+    }
+    audio.src = dataUri;
+    currentIndex = index;
+    setActive(index);
+    setStatus("正在朗读 " + (index + 1) + " / " + chunks.length);
+    var playPromise = audio.play();
+    if (playPromise && typeof playPromise.then === "function") {
+      playPromise.then(function () {
+        // 正常播放
+      }).catch(function (err) {
+        // 自动播放策略：模型触发时无用户手势，浏览器可能拦
+        setHint("浏览器拦截了自动播放，请点一下朗读按钮");
+        setStatus("已暂停（浏览器拦截自动播放）");
+        state = "stopped";
+        speakBtn.setAttribute("aria-pressed", "false");
+        speakBtn.disabled = false;
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------- 交互
+
+  function startSpeak() {
+    if (state === "speaking") return;
+    setHint("");
+    speakBtn.disabled = true;
+    setStatus("正在准备朗读…");
+    var rateVal = RATE_MAP[selectedRateKey] || 0;
+    callTool("speak_session", { voice: selectedVoice, rate: rateVal }, { ui: { surface: "read-aloud", visibility: ["model", "app"] } })
+      .then(function (result) {
+        var content = result.content;
+        if (!content || !content[0]) throw new Error("空响应");
+        var payload = JSON.parse(content[0].text);
+        if (!payload.ok) throw new Error(payload.error || "准备失败");
+        renderTranscript(payload.chunks, payload);
+        setRequest(payload);
+        state = "speaking";
+        currentRunId++;
+        var myRun = currentRunId;
+        speakBtn.setAttribute("aria-pressed", "true");
+        setStatus("正在合成第 1 块…");
+        requestChunk(0);
+      })
+      .catch(function (err) {
+        setHint("朗读启动失败: " + err.message);
+        setStatus("朗读启动失败");
+        state = "idle";
+        speakBtn.setAttribute("aria-pressed", "false");
+        speakBtn.disabled = false;
+      });
+  }
+
+  function stopSpeak() {
+    if (audio) {
+      try { audio.pause(); } catch (e) {}
+    }
+    currentRunId++;
+    // 清空 pending 表：作废在途请求的定时器与回调
+    for (var id in pending) {
+      if (pending[id] && pending[id].timer) clearTimeout(pending[id].timer);
+    }
+    pending = {};
+    state = "stopped";
+    speakBtn.setAttribute("aria-pressed", "false");
+    speakBtn.disabled = false;
+    setStatus("已停止");
+    setProgress(-1);
+    setHint("停止后当前块可能仍在合成（最长约 30 秒），完成后静默丢弃。");
+  }
+
+  function restartCurrent() {
+    if (state !== "speaking" && state !== "stopped") return;
+    currentRunId++;
+    var myRun = currentRunId;
+    if (audio) {
+      try { audio.pause(); } catch (e) {}
+    }
+    state = "speaking";
+    speakBtn.setAttribute("aria-pressed", "true");
+    // 带 voice/rate 覆盖参数（P0-1 变更语义）
+    var rateVal = RATE_MAP[selectedRateKey] || 0;
+    var idx = currentIndex >= 0 ? currentIndex : 0;
+    setStatus("正在合成第 " + (idx + 1) + " 块…");
+    requestChunk(idx, selectedVoice, rateVal);
+  }
+
+  // ---------------------------------------------------------------- 事件绑定
+
+  fillVoiceOptions();
+
+  speakBtn.addEventListener("click", startSpeak);
+  stopBtn.addEventListener("click", stopSpeak);
+
+  voiceSel.addEventListener("change", function () {
+    selectedVoice = voiceSel.value;
+    restartCurrent();
+  });
+
+  rateSel.addEventListener("change", function () {
+    selectedRateKey = rateSel.value;
+    if (selectedRateKey === "2") {
+      setHint("2× 实际与 1.5× 同效（edge-tts 倍速上限 +50%）。");
+    } else {
+      setHint("");
+    }
+    restartCurrent();
+  });
+})();
+</script>
+</body>
+</html>

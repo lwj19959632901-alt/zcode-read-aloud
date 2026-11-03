@@ -1,0 +1,62 @@
+{
+  "name": "read-aloud",
+  "version": "1.0.0",
+  "description": "朗读当前会话：常驻侧栏面板 + edge-tts 神经音色（8 个中文音色可选），逐块合成播放，支持音色/倍速/进度高亮/停止。",
+  "description_i18n": {
+    "zh-CN": "朗读当前会话：常驻侧栏面板 + edge-tts 神经音色（8 个中文音色可选），逐块合成播放，支持音色/倍速/进度高亮/停止。"
+  },
+  "userConfig": {
+    "pythonPath": {
+      "type": "string",
+      "title": "Python 可执行文件",
+      "description": "edge-tts 的 Python 解释器全路径。留空则在 PATH 中查找（依次尝试 python / python3 / py，逐个验证 --version 可用）。",
+      "default": ""
+    },
+    "defaultVoice": {
+      "type": "string",
+      "title": "默认音色",
+      "description": "8 个中文 edge 神经音色之一（如 zh-CN-XiaoxiaoNeural / yunxi）。留空用 zh-CN-XiaoxiaoNeural。",
+      "default": ""
+    },
+    "maxChars": {
+      "type": "number",
+      "title": "单次朗读上限（字符）",
+      "description": "会话文本超过此值按块边界截断。0 = 不限制。默认 12000。",
+      "default": 12000
+    },
+    "dbPath": {
+      "type": "string",
+      "title": "会话数据库路径",
+      "description": "ZCode db.sqlite 绝对路径。留空用 ~/.zcode/cli/db/db.sqlite。",
+      "default": ""
+    }
+  },
+  "mcpServers": {
+    "read-aloud": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${ZCODE_PLUGIN_ROOT}/dist/server.mjs"],
+      "cwd": "${ZCODE_PROJECT_DIR}",
+      "env": {
+        "RA_PYTHON_PATH": "${user_config.pythonPath}",
+        "RA_DEFAULT_VOICE": "${user_config.defaultVoice}",
+        "RA_MAX_CHARS": "${user_config.maxChars}",
+        "RA_DB_PATH": "${user_config.dbPath}",
+        "ZCODE_PLUGIN_DATA": "${ZCODE_PLUGIN_DATA}"
+      }
+    }
+  },
+  "ui": {
+    "surfaces": [
+      {
+        "id": "read-aloud",
+        "title": { "en": "Read Aloud", "zh-CN": "朗读" },
+        "server": "read-aloud",
+        "resourceUri": "ui://read-aloud/panel.html",
+        "availability": "session"
+      }
+    ]
+  },
+  "commands": "commands",
+  "skills": "skills"
+}

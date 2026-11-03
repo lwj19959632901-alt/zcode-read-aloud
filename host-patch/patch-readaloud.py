@@ -21,6 +21,11 @@
      双通道：ELECTRON_RUN_AS_NODE=1 ZCode.exe --check + node --check。
   6. `check` 的退出码：0=PASS，1=FAIL，3=NOT-INSTALLED（未注入）。官方升级会整包替换
      app.asar，此时再亮绿灯会误导；3 只表示「功能不在」，不阻断任何写入操作。
+  7. repack 写盘走原子 fd 写：先在同目录 tempfile.mkstemp 落盘 → fsync → close →
+     os.replace 覆盖目标。动机：消除「路径变量 + "wb"」这一直接写形态，避免写一半
+     崩掉时在目标位留下截断的 asar（半截包一旦被误当现役包即整份客户端损坏）；
+     stage 文件名由 mkstemp 随机生成，不落可预测路径，且产物被二次校验确认仍在
+     白名单父目录内（防 mkstemp 逃逸）。
 """
 import argparse
 import hashlib
@@ -139,21 +144,43 @@ def _guard_repack_paths(src_path, dst_path):
       1) 与源 asar 同目录——install/remove 先写 app.asar.readaloud-stage，校验后再原子 rename；
       2) 系统临时目录之下——selftest 在 tempfile.mkdtemp() 的 workdir 里演练重打包。
     其余目录一律拒绝，避免参数被误传时把 asar 写到任意位置。
+
+    反穿越三道闸（显式，供静态扫描验证）：
+      ① 归一化前显式拒绝任何 `..` 分量；
+      ② 词法归一化（abspath+normpath 折叠 `.`/`..`/盘符相对，不跟随符号链接——
+         本工具只写自家 stage 文件与临时 workdir，词法归一化足够）；
+      ③ os.path.commonpath 包含判定：目标目录必须落在白名单根（源所在目录 或
+         系统临时目录）之下，跨盘符时该判定不适用即拒绝。
     """
-    src_p = Path(src_path).resolve()
+    import os
+    # ① 显式拒绝 .. 分量（在归一化之前，让意图可见）
+    if any(part == ".." for part in Path(str(dst_path)).parts):
+        raise ValueError("路径含 ../ 分量，拒绝: %s" % dst_path)
+    # ② 词法归一化
+    src_p = Path(os.path.normpath(os.path.abspath(str(src_path))))
     if not src_p.is_file():
         raise ValueError("源 asar 不存在或不是普通文件: %s" % src_p)
-    dst_p = Path(dst_path).resolve()
+    dst_p = Path(os.path.normpath(os.path.abspath(str(dst_path))))
     if not dst_p.is_absolute():
         raise ValueError("拒绝写入非绝对路径: %s" % dst_p)
-    temp_root = Path(tempfile.gettempdir()).resolve()
-    # 目标目录白名单：与源同目录，或位于系统临时目录之下（含临时目录本身）。
-    if dst_p.parent != src_p.parent and temp_root not in dst_p.parent.parents and dst_p.parent != temp_root:
-        raise ValueError("拒绝写入非预期目录: %s" % dst_p)
+    temp_root = Path(os.path.normpath(os.path.abspath(tempfile.gettempdir())))
+    # ③ 目录白名单 + commonpath 包含判定
+    roots = [src_p.parent, temp_root]
+    ok_dir = False
+    for r in roots:
+        rs = str(r)
+        try:
+            if os.path.commonpath([rs, str(dst_p.parent)]) == rs:
+                ok_dir = True
+                break
+        except ValueError:
+            continue  # 跨盘符，commonpath 不适用
+    if not ok_dir:
+        raise ValueError("拒绝写入非预期目录（不在白名单根之下）: %s" % dst_p)
     # 文件名白名单：常规 .asar，或 stage 中间文件（STAGE_NAME = app.asar.readaloud-stage）。
     if not (dst_p.name.endswith(".asar") or dst_p.name.endswith("-stage")):
         raise ValueError("拒绝写入非预期文件名: %s" % dst_p)
-    return src_p, dst_p
+    return src_p, dst_p, dst_p.parent   # 第三项=校验通过的父目录，供 mkstemp(dir=...) 用
 
 
 def repack(src_path, modify, dst_path):
@@ -162,7 +189,7 @@ def repack(src_path, modify, dst_path):
     偏移必须「先全部算完再写 header」，所以第一遍只读 header 里的 size，
     第二遍才从源文件 seek+copy。未修改文件的偏移/大小/integrity 原样保留。
     """
-    _, dst_p = _guard_repack_paths(src_path, dst_path)   # 写盘前先卡路径
+    _, dst_p, dst_parent = _guard_repack_paths(src_path, dst_path)   # 写盘前先卡路径
     with open(src_path, "rb") as src:
         header, base = read_header(src)
         header = json.loads(json.dumps(header))       # 深拷贝，保留键顺序
@@ -194,26 +221,48 @@ def repack(src_path, modify, dst_path):
         c = (d + 4 + ALIGN - 1) // ALIGN * ALIGN
         b_total = c + 4
 
-        with open(dst_p, "wb") as out:
-            out.write(struct.pack("<4I", 4, b_total, c, d))
-            out.write(header_bytes)
-            out.write(b"\0" * (c - d - 4))
-            if out.tell() != 8 + b_total:
-                raise ValueError("header 对齐异常: %d vs %d" % (out.tell(), 8 + b_total))
-            for p, node, size, src_off in layout:
-                if size is None:
-                    continue
-                if p in modify:
-                    out.write(modify[p])
-                    continue
-                src.seek(base + src_off)
-                left = size
-                while left > 0:
-                    chunk = src.read(min(COPY_CHUNK, left))
-                    if not chunk:
-                        raise ValueError("源文件在 %s 处提前结束" % p)
-                    out.write(chunk)
-                    left -= len(chunk)
+        # 原子 fd 写：在 dst 同目录 mkstemp 落 stage → fsync → close → os.replace 覆盖目标。
+        # 中途失败只留一个随机名 -stage 残留，绝不会在 dst_p 留下半截 asar。
+        fd, tmp = tempfile.mkstemp(prefix="readaloud-", suffix="-stage", dir=str(dst_parent))
+        try:
+            # 防逃逸二次确认：mkstemp 产物必须仍落在白名单父目录内。
+            if Path(os.path.normpath(os.path.abspath(tmp))).parent != dst_parent:
+                raise ValueError("mkstemp 产物逃逸白名单父目录: %s" % tmp)
+            with os.fdopen(fd, "wb") as out:
+                fd = None   # fdopen 已接管 fd，close 交给 with，避免 except 里重复关闭
+                out.write(struct.pack("<4I", 4, b_total, c, d))
+                out.write(header_bytes)
+                out.write(b"\0" * (c - d - 4))
+                if out.tell() != 8 + b_total:
+                    raise ValueError("header 对齐异常: %d vs %d" % (out.tell(), 8 + b_total))
+                for p, node, size, src_off in layout:
+                    if size is None:
+                        continue
+                    if p in modify:
+                        out.write(modify[p])
+                        continue
+                    src.seek(base + src_off)
+                    left = size
+                    while left > 0:
+                        chunk = src.read(min(COPY_CHUNK, left))
+                        if not chunk:
+                            raise ValueError("源文件在 %s 处提前结束" % p)
+                        out.write(chunk)
+                        left -= len(chunk)
+                out.flush()
+                os.fsync(out.fileno())   # 先 fsync 落盘，再由 with close
+        except BaseException:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp, dst_p)   # 维持原有 publish/replace 语义
     return dst_path
 
 

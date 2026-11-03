@@ -7,7 +7,7 @@ node_modules/
 # 本地探针 / 演练产物
 tmp-probe/
 plugin-probe/
-marketplace-local/
+marketplace-local/read-aloud-probe/
 host-patch/state/
 *.pyc
 *.log
