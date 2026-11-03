@@ -204,6 +204,64 @@ node read-aloud.mjs voices
 | `sapi` | Windows `System.Speech`（PowerShell 7 全路径调用） | 离线零成本 | Node 侧分块 → UTF-8 无 BOM 文件 → PS7 `Get-Content -Raw -Encoding utf8` 读 → 逐块 `Speak()` |
 | `minimax` | MiniMax 订阅 + TTS 包装脚本（默认尝试 `~/.zcode/skills/local-ai/llm.mjs`，`--llm` 可指定任意 OpenAI 兼容等效脚本） | 取决于所用订阅 | 提质可选项，须显式 `--engine minimax`（**消耗订阅额度**） |
 
+## 正式插件：read-aloud v1.0.0（ZCode 侧栏面板）
+
+同一套 dump / 分块逻辑的第二个交付形态：**ZCode 常驻侧栏面板插件**，装进本地市场 `read-aloud-local`，与 CLI、内联片段并存（三者互不替代）。
+
+| 项 | 值 |
+| --- | --- |
+| 插件 id / 版本 | `read-aloud@read-aloud-local` / `1.0.0`（serverInfo `read-aloud`，protocolVersion `2025-06-18`） |
+| 市场源目录 | `marketplace-local/read-aloud/`（manifest `.zcode-plugin/plugin.json`） |
+| 宿主安装副本 | `~/.zcode/cli/plugins/cache/read-aloud-local/read-aloud/1.0.0/`（宿主执行的是这份**拷贝**，不是源码目录） |
+| 面板 | surface id `read-aloud`，资源 `ui://read-aloud/panel.html`，`availability:"session"`，CSP `connectDomains:[]` |
+| MCP 工具（4） | `speak_session`（dump+分块，不含音频）/ `speak_chunk`（逐块 base64，**仅面板可见**）/ `list_voices` / `session_info` |
+| userConfig（4） | `pythonPath` / `defaultVoice` / `maxChars`（默认 12000，0=不限制，服务端硬顶 200000）/ `dbPath` |
+| 插件级命令 / 技能 | `/read-aloud-panel`、技能 `read-aloud-panel`（与用户级 `/read-aloud`、技能 `read-aloud` 故意错开） |
+| 宿主注册 | `installed_plugins.json` + `known_marketplaces.json` + `config.json`（`enabledPlugins`）+ `marketplaces/read-aloud-local/marketplace.json` 快照（细节见 `666/INTEGRATION.md` 同条登记） |
+
+### 面板与 CLI 分工
+
+| 维度 | 侧栏面板插件（1.0.0） | CLI / 内联片段 |
+| --- | --- | --- |
+| 入口 | 侧栏「朗读」面板；模型可调 `speak_session` | `node read-aloud.mjs …`；`/read-aloud` 命令；`::visualize` 按钮片段 |
+| 会话定位 | `_meta.sessionId` → 显式 `sessionId` → 最新主会话（`sessionSource` 回传 `meta`/`arg`/`fallback-latest`，fallback 时面板显示实际 id） | `--session` / `--session-by-text` 显式定位（**不依赖默认会话**） |
+| 引擎 | edge 主 + **SAPI 兜底**（见下节） | `edge` 默认 → 自动回落 `sapi`；`minimax` 需显式 `--engine minimax` |
+| 音色 | 8 个中文 edge 神经音色（面板下拉） | `voices` 列 SAPI 系统语音 + edge 8 音色 |
+| 播放形态 | 面板内逐块播放，进度/高亮/停止 | 无头出声、或 `--wav` 落盘合并 |
+| 成本 | 免费（edge 需联网） | 免费；`sapi` 离线零成本；`minimax` 消耗订阅额度 |
+
+### 双引擎矩阵：edge 主，SAPI 兜底
+
+| 场景 | `edge` | `sapi`（离线兜底） |
+| --- | --- | --- |
+| 面板 `speak_chunk` | 正常路径：mp3 → `data:audio/mpeg` | **edge 合成失败即自动回退**：PS7 `System.Speech` 写 wav → `data:audio/wav`，响应 `engine:"sapi"`；SAPI 再失败则报「edge 失败 + SAPI 兜底失败」双错 |
+| CLI `speak`（默认） | 首选 | 仅**引擎不可用**类错误自动回落（未装 `edge-tts`/启动失败、`edge-tts` 退出码非 0（含网络失败）、缺 `ffmpeg`）；显式 `--engine edge` 时 fail-closed 不回落 |
+| 音色映射 | 8 个中文神经音色（`--voice` 全名/短名） | `sapiVoiceHint` 按性别就近：男声 4 个 → `Kangkang`，其余 → `Huihui`；PS 侧找不到则用系统默认音色 |
+| 依赖 | Python + `edge_tts` + 联网 | Windows + PowerShell 7 全路径（`C:/Program Files/PowerShell/7/pwsh.exe`） |
+| 缓存 | `<sha256>.mp3` | `<sha256>.wav`（命中直接复用；edge 恢复后下次仍先试 edge） |
+
+> 说明：面板当前**不单独提示**已回退 SAPI（响应里有 `engine` 字段，UI 未展示）；音色下拉仍是 edge 名，SAPI 侧按性别就近映射。本节的 SAPI 兜底以**源码目录**为准——宿主 `cache` 里的已安装副本可能滞后于源码，更新需按文末「更新提示」回拷后重启。
+
+### 停止语义
+
+- **面板**：停止 = `Audio.pause()` + `runId++`（在途响应与预取缓存按 `runId` 校验后丢弃，不再发新块）。面板**不发取消信号**，服务端已启动的合成不会被停止打断（只有超时才 SIGKILL：edge 120s / SAPI 60s）；单块 ≤120 字、最坏约 20-30 秒，该块会合成完落进磁盘缓存后静默丢弃（无害，下次命中缓存）。
+- **CLI**：无 `--wav` 时 Ctrl+C 可中途停（`stdio: 'inherit'` 直通）；`--wav` 时正在合成的那块不在 `manifest.txt` 里，不参与合并（其 wav 头未 finalize），已完成的块仍可合并。
+
+### 倍速上限
+
+| 面板档位 | 传给 edge 的 `--rate` | 实际效果 |
+| --- | --- | --- |
+| 0.5× | -50% | 慢一半 |
+| 0.75× | -25% | — |
+| 1× | +0% | 原速 |
+| 1.25× | +25% | — |
+| 1.5× | +50% | edge-tts **上限** |
+| 2× | +50% | **与 1.5× 同效**（UI 选项保留，提示行注明） |
+
+CLI 的 `--rate` 范围 `-10..10`，按 5 的步长映射到同一组百分比（-10→-50%、0→+0%、10→+50%）；越界钳制。SAPI 兜底时同一 `-10..10` 步进值直接作 `System.Speech.Rate`（整数档，非百分比）。
+
+> 更新提示：改 `marketplace-local/read-aloud/` 源码**不会**自动生效——宿主跑的是 cache 副本，更新后需回拷到 installPath 并完整重启 ZCode；注册三件套与陷阱见 `666/INTEGRATION.md`「新登记：read-aloud v1.0.0 正式插件」。
+
 ## 已知坑位（实测踩过的）
 
 | 坑 | 现象 | 对策 |

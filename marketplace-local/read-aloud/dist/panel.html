@@ -260,12 +260,15 @@
       return;
     }
     if (payload.ok && payload.requestId && payload.chunks) {
-      // 只有当前没有在途朗读时才自动播放（避免覆盖用户手动操作）
-      if (state === "idle" || state === "stopped") {
+      // 只在完全空闲时自动播放（避免覆盖用户手动操作）
+      // K09：state === "stopped" 是用户刚停止（或浏览器拦截自动播放）后的状态，
+      // 此时迟到的模型触发 speak_session 结果一律忽略，不自动重启朗读
+      if (state === "idle") {
         renderTranscript(payload.chunks, payload);
         setRequest(payload);
         state = "speaking";
         currentRunId++;
+        dropPrefetchCache(); // 新 run：清空上一轮预取缓存与在途表
         setStatus("正在合成第 1 块…");
         requestChunk(0);
       }
@@ -294,6 +297,19 @@
   var currentIndex = -1;
   var selectedVoice = VOICE_LIST[0].name;
   var selectedRateKey = "1";
+
+  // K10：背景预取（播放第 N 块时预请求 N+1）
+  // prefetchCache：index -> { runId, dataUri, payload }，仅当 runId === currentRunId 时可用
+  // prefetchInflight：index -> { runId, promise }，同 index 复用同一在途请求（防双发）
+  var prefetchCache = {};
+  var prefetchInflight = {};
+
+  // 每次 currentRunId++（开始/停止/重启/模型触发）都要清空预取表：
+  // 旧 run 的在途响应靠 myRun 校验丢弃，缓存条目靠 runId 校验过期
+  function dropPrefetchCache() {
+    prefetchCache = {};
+    prefetchInflight = {};
+  }
 
   function setStatus(text) {
     if (statusEl) statusEl.textContent = text || "";
@@ -384,18 +400,78 @@
 
   // ---------------------------------------------------------------- 播放
 
-  function requestChunk(index, voiceOverride, rateOverride) {
-    var myRun = currentRunId;
+  // 单次 speak_chunk 请求 → 解析后的 payload（不含 runId 判断，由调用方负责）
+  function callChunk(index, voiceOverride, rateOverride) {
     var args = { requestId: requestId, index: index };
     if (voiceOverride) args.voice = voiceOverride;
     if (rateOverride !== undefined && rateOverride !== null) args.rate = rateOverride;
     return callTool("speak_chunk", args, { ui: { surface: "read-aloud", visibility: ["app"] } })
       .then(function (result) {
-        if (myRun !== currentRunId) return; // runId 失效：停止/重启后丢弃在途响应
         var content = result.content;
         if (!content || !content[0]) throw new Error("空响应");
         var payload = JSON.parse(content[0].text);
         if (!payload.ok) throw new Error(payload.error || "合成失败");
+        return payload;
+      });
+  }
+
+  // 背景预取：播放第 N 块时请求 N+1。
+  // - 已有当前 run 的缓存 → 直接复用，不再发请求
+  // - 已有当前 run 的在途请求 → 复用同一 Promise（防双发重复）
+  // - 预取失败静默返回 null，下一块按需重请（不打扰用户）
+  function prefetchChunk(index) {
+    if (index < 0 || index >= chunks.length) return null;
+    var cached = prefetchCache[index];
+    if (cached && cached.runId === currentRunId) return Promise.resolve(cached);
+    var inflight = prefetchInflight[index];
+    if (inflight && inflight.runId === currentRunId) return inflight.promise;
+    var myRun = currentRunId;
+    var entry = { runId: myRun, promise: null };
+    entry.promise = callChunk(index)
+      .then(function (payload) {
+        if (myRun !== currentRunId) return null; // runId 守卫：停止/重启后丢弃陈旧响应
+        prefetchCache[index] = { runId: myRun, dataUri: payload.dataUri, payload: payload };
+        return prefetchCache[index];
+      })
+      .catch(function () { return null; })
+      .then(function (res) {
+        var cur = prefetchInflight[index];
+        if (cur && cur.runId === myRun) delete prefetchInflight[index];
+        return res && res.runId === currentRunId ? res : null;
+      });
+    prefetchInflight[index] = entry;
+    return entry.promise;
+  }
+
+  function requestChunk(index, voiceOverride, rateOverride) {
+    var myRun = currentRunId;
+    var hasOverride = !!voiceOverride || (rateOverride !== undefined && rateOverride !== null);
+    var cached = !hasOverride ? prefetchCache[index] : null;
+    var inflight = !hasOverride ? prefetchInflight[index] : null;
+    var source;
+    if (cached && cached.runId === currentRunId) {
+      delete prefetchCache[index];
+      source = Promise.resolve(cached.payload);
+    } else if (inflight && inflight.runId === currentRunId) {
+      // 预取仍在途：复用，不重复发同一 index 的请求
+      source = inflight.promise.then(function (res) {
+        delete prefetchCache[index]; // 已消费，避免同一 index 的音频重复驻留
+        return res ? res.payload : null;
+      });
+    } else {
+      source = callChunk(index, voiceOverride, rateOverride);
+    }
+    return source
+      .then(function (payload) {
+        if (myRun !== currentRunId) return; // runId 失效：停止/重启后丢弃在途响应
+        if (!payload) {
+          // 预取链路失败（null）：退回直接请求，保证播放不中断
+          return callChunk(index, voiceOverride, rateOverride).then(function (p2) {
+            if (myRun !== currentRunId) return;
+            if (p2.voice) selectedVoice = p2.voice;
+            playDataUri(p2.dataUri, index, p2);
+          });
+        }
         if (payload.voice) selectedVoice = payload.voice;
         if (payload.rate !== undefined) {
           // 回显 effective rate，但面板倍速映射保持原样
@@ -448,6 +524,7 @@
     currentIndex = index;
     setActive(index);
     setStatus("正在朗读 " + (index + 1) + " / " + chunks.length);
+    prefetchChunk(index + 1); // K10：第 N 块开播即预请求第 N+1 块（末块自动跳过）
     var playPromise = audio.play();
     if (playPromise && typeof playPromise.then === "function") {
       playPromise.then(function () {
@@ -481,6 +558,7 @@
         setRequest(payload);
         state = "speaking";
         currentRunId++;
+        dropPrefetchCache(); // 新 run：清空上一轮预取缓存与在途表
         var myRun = currentRunId;
         speakBtn.setAttribute("aria-pressed", "true");
         setStatus("正在合成第 1 块…");
@@ -500,6 +578,7 @@
       try { audio.pause(); } catch (e) {}
     }
     currentRunId++;
+    dropPrefetchCache(); // 旧 run 的预取结果一律作废
     // 清空 pending 表：作废在途请求的定时器与回调
     for (var id in pending) {
       if (pending[id] && pending[id].timer) clearTimeout(pending[id].timer);
@@ -516,6 +595,7 @@
   function restartCurrent() {
     if (state !== "speaking" && state !== "stopped") return;
     currentRunId++;
+    dropPrefetchCache(); // 音色/倍速变更后旧预取音频已失效（voice/rate 不同）
     var myRun = currentRunId;
     if (audio) {
       try { audio.pause(); } catch (e) {}

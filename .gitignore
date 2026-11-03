@@ -11,3 +11,4 @@ marketplace-local/read-aloud-probe/
 host-patch/state/
 *.pyc
 *.log
+*.bak-*
