@@ -15,20 +15,6 @@
       "description_i18n": {
         "zh-CN": "朗读当前会话：常驻侧栏面板 + edge-tts 神经音色（8 个中文音色可选），逐块合成播放，支持音色/倍速/进度高亮/停止。"
       }
-    },
-    {
-      "name": "read-aloud-probe",
-      "source": "./read-aloud-probe",
-      "version": "0.0.1",
-      "description": "朗读按钮可行性验证：常驻侧栏面板 + 按钮 → MCP 调 edge-tts 神经音色合成 → 面板播放。验证用，非正式。",
-      "category": "productivity",
-      "displayName": "Read Aloud Probe",
-      "displayName_i18n": {
-        "zh-CN": "朗读验证"
-      },
-      "description_i18n": {
-        "zh-CN": "朗读按钮可行性验证：常驻侧栏面板 + 按钮 → MCP 调 edge-tts 神经音色合成 → 面板播放。验证用，非正式。"
-      }
     }
   ]
 }
