@@ -13,12 +13,12 @@
 // 正文一律经 UTF-8 无 BOM 文件传递（chunks.json + speak.ps1），不经命令行。
 
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, rmSync, renameSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, rmSync, renameSync, statSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import process from "node:process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import {
   EDGE_DEFAULT_VOICE,
@@ -73,12 +73,22 @@ function main() {
 }
 
 // 作为入口运行时才接管 stdin；被单测 import（命令构造单测）时不得产生副作用。
+//
+// P0（2026-11-04）：不能直接比 import.meta.url 与 pathToFileURL(process.argv[1])。宿主
+// ~/.zcode 是 junction（C:\Users\<user>\.zcode → D:\ZCodeData\app-data），Node 会把
+// process.argv[1] 解析成 realpath（D: 拼法），import.meta.url 却保留启动拼法（C: junction），
+// 字符串不等 → main() 不跑 → 读完 stdin 静默 exit 0（宿主拿不到任何工具）。
+// 故两侧都先 realpath 再比较；Windows 路径大小写不敏感，统一小写后比对。
+// 任何异常一律 fail-open 视为 main：宁可多接管 stdin，也不能吞掉启动路径。
 function isMainModule() {
   if (!process.argv[1]) return false;
   try {
-    return import.meta.url === pathToFileURL(process.argv[1]).href;
+    const selfPath = realpathSync(fileURLToPath(import.meta.url));
+    const argvPath = realpathSync(process.argv[1]);
+    const norm = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
+    return norm(selfPath) === norm(argvPath);
   } catch {
-    return false;
+    return true; // fail-open：realpath / URL 解析异常时按入口运行
   }
 }
 
