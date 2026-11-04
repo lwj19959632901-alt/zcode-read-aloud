@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -179,24 +180,43 @@ function createPythonEdgeStub() {
     "    return None",
     "",
     'media = arg("--write-media")',
-    'marker = os.environ.get("RA_TEST_STUB_MARKER")',
+    "marker = os.environ.get('RA_TEST_STUB_MARKER')",
+    "# 行为可由控制文件逐次切换（同一 server 进程内做「先失败后恢复」回归）：",
+    "# 第一行 mode（healthy/fail/partial），第二行 sleep 秒数。控制文件存在时优先于环境变量。",
+    "control = os.environ.get('RA_TEST_STUB_CONTROL')",
+    "mode = None",
+    "sleep_s = float(os.environ.get('RA_TEST_STUB_SLEEP', '0'))",
+    "if control and os.path.exists(control):",
+    "    with open(control, encoding='utf-8') as fh:",
+    "        lines = [ln.strip() for ln in fh.read().splitlines()]",
+    "    mode = lines[0] if lines and lines[0] else 'healthy'",
+    "    if len(lines) > 1 and lines[1]:",
+    "        sleep_s = float(lines[1])",
+    "if mode is None:",
+    "    if os.environ.get('RA_TEST_STUB_FAIL') == '1':",
+    "        mode = 'fail'",
+    "    elif os.environ.get('RA_TEST_STUB_PARTIAL') == '1':",
+    "        mode = 'partial'",
+    "    else:",
+    "        mode = 'healthy'",
     "if marker:",
-    '    with open(marker, "a", encoding="utf-8") as fh:',
-    '        fh.write("started" + chr(10))',
-    'if os.environ.get("RA_TEST_STUB_FAIL") == "1":',
-    '    sys.stderr.write("stub edge_tts: forced failure" + chr(10))',
+    "    with open(marker, 'a', encoding='utf-8') as fh:",
+    "        fh.write('started' + chr(10))",
+    "if mode == 'fail':",
+    "    sys.stderr.write('stub edge_tts: forced failure' + chr(10))",
     "    sys.exit(1)",
-    'if os.environ.get("RA_TEST_STUB_PARTIAL") == "1":',
-    '    with open(media, "wb") as fh:',
-    '        fh.write(bytes([73, 68, 51]) + bytes(10))  # 先写半截内容再挂起（模拟中断残留）',
-    'time.sleep(float(os.environ.get("RA_TEST_STUB_SLEEP", "0")))',
+    "if mode == 'partial':",
+    "    with open(media, 'wb') as fh:",
+    "        fh.write(bytes([73, 68, 51]) + bytes(10))  # 先写半截内容再挂起（模拟中断残留）",
+    "if sleep_s > 0:",
+    "    time.sleep(sleep_s)",
     "if media:",
-    '    with open(media, "wb") as fh:',
+    "    with open(media, 'wb') as fh:",
     "        fh.write(bytes([73, 68, 51, 3, 0, 0, 0, 0, 0, 0]) + bytes([255, 251]) + bytes(2048))",
     "if marker:",
-    '    with open(marker, "a", encoding="utf-8") as fh:',
-    '        fh.write("done" + chr(10))',
-    'sys.stderr.write("stub edge_tts media=" + str(media) + chr(10))',
+    "    with open(marker, 'a', encoding='utf-8') as fh:",
+    "        fh.write('done' + chr(10))",
+    "sys.stderr.write('stub edge_tts media=' + str(media) + chr(10))",
     "",
   ].join("\n");
   fs.writeFileSync(path.join(stubDir, "edge_tts.py"), script, "utf8");
@@ -212,6 +232,17 @@ async function waitForMarker(marker, needle, timeoutMs) {
     await new Promise((r) => setTimeout(r, 25));
   }
   return false;
+}
+
+// 与 dist/server.mjs 的 cacheKeyFor 保持一致：sha256(text + "\0" + voice + "\0" + rateArg)
+function cacheKeyFor(text, voice, rateArg) {
+  return createHash("sha256").update(text + "\0" + voice + "\0" + rateArg).digest("hex");
+}
+
+// 列出缓存目录里的所有残留文件（含 .part 临时文件）；目录不存在时返回空数组。
+function listCacheFiles(cacheDir) {
+  const chunksDir = path.join(cacheDir, "chunks");
+  return fs.existsSync(chunksDir) ? fs.readdirSync(chunksDir) : [];
 }
 
 // ---------------------------------------------------------------- 协议自测
@@ -913,6 +944,92 @@ test("tools/call：edge 超时中断不在缓存位留半截 mp3（原子写回�
   }
 });
 
+test("tools/call：edge 超时失败后第二次请求（换健康桩）重新合成，不被残留遮蔽", async () => {
+  const dbPath = await createFixtureDb();
+  const { stubDir, marker } = createPythonEdgeStub();
+  const cacheDir = path.join(TMP, "cache-retry-after-timeout");
+  const control = path.join(TMP, "stub-control-retry.txt");
+  // 第一次：桩写 13 字节后挂起（复现评审探针）；第二次：改成健康桩，同一 server 进程内重试
+  fs.writeFileSync(control, "partial\n2.5\n", "utf8");
+  const client = new McpClient(SERVER, {
+    RA_DB_PATH: dbPath,
+    ZCODE_PLUGIN_DATA: cacheDir,
+    PYTHONPATH: stubDir,
+    RA_TEST_STUB_CONTROL: control,
+    RA_TEST_STUB_MARKER: marker,
+    RA_SYNTH_TIMEOUT_MS: "600",
+    RA_PS7_PATH: path.join(TMP, "no-such-pwsh.exe"), // 隔离出 edge 超时本身
+  });
+  try {
+    const sessionResp = await client.call("tools/call", {
+      name: "speak_session",
+      arguments: { sessionId: "sess_main" },
+    });
+    const session = JSON.parse(sessionResp.result.content[0].text);
+
+    const first = await client.call("tools/call", {
+      name: "speak_chunk",
+      arguments: { requestId: session.requestId, index: 0 },
+    });
+    assert.ok(first.error, "第一次应失败（edge 超时且无 SAPI 可兜底）");
+    assert.match(String(first.error.message), /超时/);
+    // 失败后缓存目录必须干净：既无最终 mp3，也无 .part 临时文件
+    assert.deepEqual(listCacheFiles(cacheDir), [], "失败后缓存目录不应有任何残留（含 .part）");
+
+    fs.writeFileSync(control, "healthy\n0\n", "utf8"); // 换健康桩
+    const second = await client.call("tools/call", {
+      name: "speak_chunk",
+      arguments: { requestId: session.requestId, index: 0 },
+    });
+    assert.ok(second.result, "第二次应成功: " + JSON.stringify(second.error || {}));
+    const chunk = JSON.parse(second.result.content[0].text);
+    assert.equal(chunk.engine, "edge", "健康桩应走 edge 引擎");
+    assert.equal(chunk.cached, false, "第一次失败未留缓存，第二次必须重新合成");
+    assert.ok(chunk.bytes >= 1024, "重合成产物应达有效大小下限，实测 " + chunk.bytes + " 字节");
+    const files = listCacheFiles(cacheDir);
+    assert.equal(files.filter((f) => f.indexOf(".part") >= 0).length, 0, "不应有 .part 残留: " + files.join(", "));
+    assert.equal(files.filter((f) => f.endsWith(".mp3")).length, 1, "应恰好有一个完整 mp3 缓存: " + files.join(", "));
+  } finally {
+    client.close();
+  }
+});
+
+test("tools/call：0 字节 mp3 缓存不被当有效命中（大小校验下限）", async () => {
+  const dbPath = await createFixtureDb();
+  const { stubDir } = createPythonEdgeStub();
+  const cacheDir = path.join(TMP, "cache-empty-mp3");
+  const client = new McpClient(SERVER, {
+    RA_DB_PATH: dbPath,
+    ZCODE_PLUGIN_DATA: cacheDir,
+    PYTHONPATH: stubDir,
+  });
+  try {
+    const sessionResp = await client.call("tools/call", {
+      name: "speak_session",
+      arguments: { sessionId: "sess_main" },
+    });
+    const session = JSON.parse(sessionResp.result.content[0].text);
+
+    // 预埋 0 字节 mp3：修复前 existsSync 即命中，会返回 bytes=0 的空音频
+    const chunksDir = path.join(cacheDir, "chunks");
+    fs.mkdirSync(chunksDir, { recursive: true });
+    const emptyPath = path.join(chunksDir, cacheKeyFor("你好。", "zh-CN-XiaoxiaoNeural", "+0%") + ".mp3");
+    fs.writeFileSync(emptyPath, Buffer.alloc(0));
+
+    const resp = await client.call("tools/call", {
+      name: "speak_chunk",
+      arguments: { requestId: session.requestId, index: 0 },
+    });
+    const chunk = JSON.parse(resp.result.content[0].text);
+    assert.ok(chunk.ok, "speak_chunk 应成功");
+    assert.equal(chunk.cached, false, "0 字节 mp3 不应被当有效缓存命中");
+    assert.ok(chunk.bytes >= 1024, "重合成产物应达有效大小下限，实测 " + chunk.bytes + " 字节");
+    assert.ok(fs.statSync(emptyPath).size >= 1024, "缓存位应被完整产物替换");
+  } finally {
+    client.close();
+  }
+});
+
 test("tools/call：voice/rate 覆盖回写会话（后续无覆盖请求沿用新值）", async () => {
   const dbPath = await createFixtureDb();
   const { stubDir } = createPythonEdgeStub();
@@ -1124,6 +1241,51 @@ test("SAPI 兜底：edge 失败时真机合成 wav（PS7 System.Speech）", asyn
     assert.equal(chunk2.engine, "sapi");
     assert.equal(chunk2.cached, true, "第二次应命中 wav 缓存");
     assert.equal(chunk2.bytes, chunk.bytes, "缓存字节数应一致");
+  } finally {
+    client.close();
+  }
+});
+
+test("SAPI 兜底：缓存位有毒 mp3 时 edge 失败仍能回退 SAPI（毒缓存不遮蔽兜底）", async (t) => {
+  if (!fs.existsSync(PS7_PATH)) {
+    t.skip("PowerShell 7 不存在（" + PS7_PATH + "），跳过 SAPI 真机冒烟");
+    return;
+  }
+  const dbPath = await createFixtureDb();
+  const { stubDir } = createPythonEdgeStub();
+  const cacheDir = path.join(TMP, "cache-sapi-poison-mp3");
+  const client = new McpClient(SERVER, {
+    RA_DB_PATH: dbPath,
+    ZCODE_PLUGIN_DATA: cacheDir,
+    PYTHONPATH: stubDir,
+    RA_TEST_STUB_FAIL: "1", // edge 必失败 → 只能走 SAPI
+    RA_PS7_PATH: PS7_PATH,
+  });
+  try {
+    const sessionResp = await client.call("tools/call", {
+      name: "speak_session",
+      arguments: { sessionId: "sess_main" },
+    });
+    const session = JSON.parse(sessionResp.result.content[0].text);
+
+    // 预埋评审复现出来的 13 字节毒 mp3：修复前它会被 existsSync 命中，SAPI 永远没机会被尝试
+    const chunksDir = path.join(cacheDir, "chunks");
+    fs.mkdirSync(chunksDir, { recursive: true });
+    const key = cacheKeyFor("你好。", "zh-CN-XiaoxiaoNeural", "+0%");
+    const poisonPath = path.join(chunksDir, key + ".mp3");
+    fs.writeFileSync(poisonPath, Buffer.from([73, 68, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+
+    const resp = await client.call("tools/call", {
+      name: "speak_chunk",
+      arguments: { requestId: session.requestId, index: 0 },
+    });
+    assert.ok(resp.result, "毒缓存存在时也应返回结果: " + JSON.stringify(resp.error || {}));
+    const chunk = JSON.parse(resp.result.content[0].text);
+    assert.equal(chunk.engine, "sapi", "edge 失败后应触达 SAPI 兜底（修复前被毒 mp3 遮蔽）");
+    assert.equal(chunk.cached, false, "SAPI 首次合成 cached=false");
+    assert.ok(chunk.bytes >= 1024, "SAPI wav 应达有效大小下限，实测 " + chunk.bytes + " 字节");
+    assert.equal(fs.existsSync(poisonPath), false, "毒 mp3 应被 unlink，不得继续占据缓存 key");
+    assert.ok(fs.existsSync(path.join(chunksDir, key + ".wav")), "SAPI 兜底 wav 应已落盘");
   } finally {
     client.close();
   }

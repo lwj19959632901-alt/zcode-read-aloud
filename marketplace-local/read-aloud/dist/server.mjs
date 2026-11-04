@@ -13,7 +13,7 @@
 // 正文一律经 UTF-8 无 BOM 文件传递（chunks.json + speak.ps1），不经命令行。
 
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, rmSync, renameSync, statSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, rmSync, renameSync, statSync, realpathSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
@@ -231,8 +231,9 @@ function cacheKeyFor(text, voice, rateArg) {
 
 const inflightSynth = new Map(); // cacheKey → Promise（同 key 并发共用一次合成，避免并发写同一音频文件）
 
-// 小于该值的缓存音频文件视为无效（历史非原子写遗留的半截/空文件防御）。
-// 真实 edge mp3 与 SAPI wav（44100Hz/16bit/单声道）都远大于 1KB；只挡明显垃圾，不做内容级解析。
+// 小于该值的缓存音频文件视为无效（历史非原子写遗留的半截/空文件防御）：size > 0 由
+// 1024 字节下限一并覆盖（0 字节必然被拒）。真实 edge mp3 与 SAPI wav（44100Hz/16bit/
+// 单声道）都远大于 1KB；只挡明显垃圾，不做内容级解析。
 const MIN_CACHE_BYTES = 1024;
 
 function validCacheFile(p) {
@@ -245,6 +246,34 @@ function validCacheFile(p) {
 
 function evictCacheFile(p) {
   try { if (existsSync(p)) rmSync(p, { force: true }); } catch { /* ignore */ }
+}
+
+// 原子落盘：临时文件先 fsync 再同目录 rename 到最终缓存位（同卷 rename 原子，外部永远
+// 看不到半截文件）。fsync 只影响掉电后的持久性，Windows 的 FlushFileBuffers 偶发 EPERM，
+// 失败不应把已合成成功的音频判死——原子性由 rename 保证，故这里容忍 fsync 失败。
+function flushThenRename(partFile, finalFile) {
+  try {
+    const fd = openSync(partFile, "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  } catch { /* 忽略：见上方注释 */ }
+  renameSync(partFile, finalFile);
+}
+
+// Windows 上被杀子进程的文件句柄释放有延迟，单次 rm 可能 EBUSY/EPERM，需有界重试。
+// 重试耗尽仍残留的只是随机后缀 .part 临时文件：不占缓存 key，不会遮蔽 SAPI 兜底。
+async function removeTempFileWithRetry(p, attempts = 5) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (!existsSync(p)) return;
+      rmSync(p, { force: true });
+      if (!existsSync(p)) return;
+    } catch { /* 句柄未释放，稍后重试 */ }
+    await new Promise((r) => setTimeout(r, 40));
+  }
 }
 
 function synthTimeoutMs() {
@@ -286,8 +315,8 @@ function runProcess(label, exe, args, timeoutMs) {
   });
 }
 
-// edge 合成与 SAPI 路径同款原子写：先写 .part 临时文件，子进程成功退出后再原子改名到最终缓存位。
-// 直写最终路径时，超时 SIGKILL / 中途失败会留下半截 mp3 永久占据该缓存 key，
+// edge 合成与 SAPI 路径同款原子写：先写 .part 临时文件，子进程成功退出后 fsync + 原子改名到
+// 最终缓存位。直写最终路径时，超时 SIGKILL / 中途失败会留下半截 mp3 永久占据该缓存 key，
 // 被 existsSync 当有效缓存命中并永久遮蔽 SAPI 兜底 wav（P0-2 评审修复）。
 async function synthesizeEdge(text, voice, rateArg, mp3) {
   const { path: python } = await resolvePython();
@@ -295,10 +324,13 @@ async function synthesizeEdge(text, voice, rateArg, mp3) {
   try {
     const args = ["-m", "edge_tts", "--voice", voice, "--rate=" + rateArg, "--text", text, "--write-media", partFile];
     await runProcess("edge-tts", python, args, synthTimeoutMs());
-    if (!existsSync(partFile)) throw new Error("合成未产出 mp3 文件");
-    renameSync(partFile, mp3);
+    // 退出码 0 不等于有产物：空文件不得进缓存（否则首响就是空音频，且下次才被大小校验清掉）。
+    const produced = existsSync(partFile) ? statSync(partFile).size : 0;
+    if (produced <= 0) throw new Error("合成未产出有效 mp3 文件");
+    flushThenRename(partFile, mp3);
   } finally {
-    try { if (existsSync(partFile)) rmSync(partFile, { force: true }); } catch { /* ignore */ }
+    // 失败/超时路径必须清掉临时文件，绝不把半截内容留在缓存命名空间里。
+    await removeTempFileWithRetry(partFile);
   }
 }
 
