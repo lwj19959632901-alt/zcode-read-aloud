@@ -9,20 +9,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   buildSapiScript,
   buildSpeechChunks,
   buildSpeakPlan,
   buildWidgetFragment,
+  classifySapiCompletion,
+  cleanupPlanDir,
   edgeRateArg,
   escapeHtml,
   extractMessages,
   findSessionsByText,
   formatDump,
   isEdgeUnavailable,
+  isInterruptedResult,
   listEdgeVoices,
   mergeConsecutive,
   openDatabase,
@@ -38,6 +41,7 @@ import {
   resolveEdgeVoice,
   resolveSessionId,
   roleLabel,
+  runMp3Plan,
   runSapi,
   splitSentences,
   WIDGET_ROOT_ID,
@@ -737,35 +741,398 @@ test("edge：--voice 支持全名/短名/未知值，未给时用默认 Xiaoxiao
 
 test("speak --dry-run：edge 默认引擎带上 voice/rate/wav，产物路径按块号命名", () => {
   const plan = buildSpeakPlan("【用户】你好。世界。", { rate: 3, voice: "yunxi", wav: path.join(TMP, "edge-out.wav"), spawn: presentEdgeSpawn() });
-  assert.equal(plan.engine, "edge", "未指定 --engine 时应默认 edge");
-  assert.equal(plan.voice, "zh-CN-YunxiNeural");
-  assert.equal(plan.rateArg, "+15%");
-  assert.equal(plan.wav, path.join(TMP, "edge-out.wav"), "plan.wav 必须按 --wav 设置（否则主流程不出声也不落盘）");
-  // 分块目录固定在 os.tmpdir()/read-aloud-edge（不随 --wav 漂移到别处）
-  assert.equal(plan.dir, path.join(os.tmpdir(), "read-aloud-edge"));
-  assert.equal(plan.commands.length, 2);
-  const args = plan.commands[0].args;
-  assert.equal(args[0], "--text");
-  assert.ok(args.indexOf("--voice") >= 0, "命令必须显式带音色");
-  assert.equal(args[args.indexOf("--voice") + 1], "zh-CN-YunxiNeural");
-  assert.ok(args.indexOf("--rate=+15%") >= 0, "语速必须用 edge 的 =百分比 形态");
-  assert.ok(args.indexOf("--write-media") >= 0);
-  assert.match(plan.commands[0].out, /part001\.mp3$/);
-  assert.match(plan.commands[1].out, /part002\.mp3$/);
-  assert.ok(plan.commands[0].out.indexOf(plan.dir) === 0, "产物必须落在 plan.dir 下");
-  // 第二块的 out 与命令里 --write-media 的值必须一致（否则收不到产物）
-  assert.equal(plan.commands[1].out, plan.commands[1].args[plan.commands[1].args.indexOf("--write-media") + 1]);
-  const printed = printPlan(plan);
-  assert.match(printed, /engine=edge/);
-  assert.match(printed, /voice=zh-CN-YunxiNeural/);
-  assert.match(printed, /--rate=\+15%/);
-  assert.match(printed, /--wav/);
-  assert.match(printed, /转 44\.1k 单声道 wav/);
-  // 无 --wav 时计划里要说清「会经 SoundPlayer 真出声」（不是只留 mp3 不出声）
-  const playPlan = buildSpeakPlan("【用户】你好。", { rate: 0, spawn: presentEdgeSpawn() });
-  assert.equal(playPlan.wav, null);
-  assert.match(printPlan(playPlan), /SoundPlayer 直接发声/);
+  try {
+    assert.equal(plan.engine, "edge", "未指定 --engine 时应默认 edge");
+    assert.equal(plan.voice, "zh-CN-YunxiNeural");
+    assert.equal(plan.rateArg, "+15%");
+    assert.equal(plan.wav, path.join(TMP, "edge-out.wav"), "plan.wav 必须按 --wav 设置（否则主流程不出声也不落盘）");
+    // 分块目录是本次运行的独占目录（mkdtemp，tmp 下 read-aloud-edge- 前缀，不随 --wav 漂移到别处）
+    assert.ok(
+      plan.dir.startsWith(path.join(fs.realpathSync(os.tmpdir()), "read-aloud-edge-")),
+      "分块目录应是 tmp 下 read-aloud-edge- 前缀的独占子目录: " + plan.dir
+    );
+    assert.ok(fs.existsSync(plan.dir), "计划期独占目录必须已存在（dry-run 会原样打印它）");
+    assert.equal(plan.ownsDir, true, "mkdtemp 目录必须带 ownsDir 标记（收尾清理依据）");
+    assert.equal(plan.commands.length, 2);
+    const args = plan.commands[0].args;
+    assert.equal(args[0], "--text");
+    assert.ok(args.indexOf("--voice") >= 0, "命令必须显式带音色");
+    assert.equal(args[args.indexOf("--voice") + 1], "zh-CN-YunxiNeural");
+    assert.ok(args.indexOf("--rate=+15%") >= 0, "语速必须用 edge 的 =百分比 形态");
+    assert.ok(args.indexOf("--write-media") >= 0);
+    assert.match(plan.commands[0].out, /part001\.mp3$/);
+    assert.match(plan.commands[1].out, /part002\.mp3$/);
+    assert.ok(plan.commands[0].out.indexOf(plan.dir) === 0, "产物必须落在 plan.dir 下");
+    // 第二块的 out 与命令里 --write-media 的值必须一致（否则收不到产物）
+    assert.equal(plan.commands[1].out, plan.commands[1].args[plan.commands[1].args.indexOf("--write-media") + 1]);
+    const printed = printPlan(plan);
+    assert.match(printed, /engine=edge/);
+    assert.match(printed, /voice=zh-CN-YunxiNeural/);
+    assert.match(printed, /--rate=\+15%/);
+    assert.match(printed, /--wav/);
+    assert.match(printed, /转 44\.1k 单声道 wav/);
+    // dry-run 打印的目录必须与真实使用的目录一致（否则照着日志找产物会落空）
+    assert.ok(printed.indexOf(plan.dir) >= 0, "dry-run 必须打印真实分块目录: " + plan.dir);
+    // 无 --wav 时计划里要说清「会经 SoundPlayer 真出声」（不是只留 mp3 不出声）
+    const playPlan = buildSpeakPlan("【用户】你好。", { rate: 0, spawn: presentEdgeSpawn() });
+    try {
+      assert.equal(playPlan.wav, null);
+      assert.match(printPlan(playPlan), /SoundPlayer 直接发声/);
+    } finally {
+      cleanupPlanDir(playPlan);
+    }
+  } finally {
+    cleanupPlanDir(plan);
+  }
 });
+
+test("edge：分块目录按运行独占——两次计划不同目录、产物各归各、互不互踩", () => {
+  const first = buildSpeakPlan("【用户】你好。世界。", { rate: 0, spawn: presentEdgeSpawn() });
+  const second = buildSpeakPlan("【用户】你好。世界。", { rate: 0, spawn: presentEdgeSpawn() });
+  try {
+    const prefix = path.join(fs.realpathSync(os.tmpdir()), "read-aloud-edge-");
+    assert.notEqual(first.dir, second.dir, "两次计划必须拿到不同目录（固定共享目录会让并发的两个 CLI 互踩 partNNN.mp3）");
+    for (const plan of [first, second]) {
+      assert.ok(plan.dir.startsWith(prefix), "独占目录应在 tmp 下且带 read-aloud-edge- 前缀: " + plan.dir);
+      assert.ok(fs.existsSync(plan.dir), "计划期 mkdtemp 目录应已存在");
+      assert.equal(plan.ownsDir, true, "mkdtemp 目录必须标记 ownsDir（收尾清理依据）");
+      for (const command of plan.commands) {
+        assert.ok(command.out.indexOf(plan.dir) === 0, "产物必须落在本计划自己的目录下: " + command.out);
+      }
+    }
+    assert.notEqual(first.commands[0].out, second.commands[0].out, "同名 partNNN.mp3 也必须隔离在各自目录下");
+  } finally {
+    cleanupPlanDir(first);
+    cleanupPlanDir(second);
+  }
+});
+
+test("edge：cleanupPlanDir 只清 ownsDir 的目录，非自有目录一律不碰", () => {
+  const owned = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "read-aloud-edge-"));
+  const foreign = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "read-aloud-edge-foreign-"));
+  try {
+    fs.writeFileSync(path.join(owned, "part001.mp3"), "x", "utf8");
+    assert.equal(cleanupPlanDir({ engine: "edge", dir: owned, ownsDir: true }), true, "owned 目录应被清理");
+    assert.equal(fs.existsSync(owned), false, "owned 目录连同内部产物应一并清掉");
+    // 非 owned（minimax 固定目录 / 用户 --wav 所在目录）：返回 false 且原样保留
+    assert.equal(cleanupPlanDir({ engine: "minimax", dir: foreign, ownsDir: false }), false);
+    assert.equal(fs.existsSync(foreign), true, "非 owned 目录必须原样保留");
+    assert.equal(cleanupPlanDir(null), false);
+    assert.equal(cleanupPlanDir({ engine: "edge", dir: owned, ownsDir: true }), true, "目录已不存在时 force 清理不算失败、不抛");
+  } finally {
+    try {
+      fs.rmSync(foreign, { recursive: true, force: true });
+    } catch {
+      /* 忽略 */
+    }
+  }
+});
+
+test("edge：runMp3Plan 命令失败（抛错路径）也清掉独占分块目录", () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "read-aloud-edge-"));
+  const plan = {
+    engine: "edge",
+    chunks: ["块"],
+    dir: dir,
+    ownsDir: true,
+    voice: "test",
+    // 不存在的命令：spawnSync 返回 error，runCommandList 对 edge 抛「启动失败」
+    commands: [{ command: "read-aloud-no-such-edge-cmd-xyz", args: ["--write-media", path.join(dir, "part001.mp3")], out: path.join(dir, "part001.mp3") }],
+  };
+  assert.throws(() => runMp3Plan(plan), /启动失败|退出码/, "命令失败必须抛出（fail-closed 不变）");
+  assert.equal(fs.existsSync(dir), false, "失败路径必须经 finally 清掉独占目录（成功失败都收尾）");
+});
+
+test("edge：isInterruptedResult 只把 SIGINT 与 STATUS_CONTROL_C_EXIT 认成中断", () => {
+  assert.equal(isInterruptedResult({ status: null, signal: "SIGINT" }), true, "POSIX 信号终止");
+  assert.equal(isInterruptedResult({ status: 3221225786, signal: null }), true, "Windows STATUS_CONTROL_C_EXIT");
+  assert.equal(isInterruptedResult({ status: -1073741510, signal: null }), true, "同一状态码的有符号写法也要认");
+  assert.equal(isInterruptedResult({ status: 0, signal: null }), false);
+  assert.equal(isInterruptedResult({ status: 1, signal: null }), false, "普通失败码不是中断");
+  assert.equal(isInterruptedResult({ status: 2, signal: null }), false);
+  assert.equal(isInterruptedResult(null), false);
+});
+
+// ---------------------------------------------------------------- SIGINT 清理（真实信号）
+
+// Windows 没有 POSIX 信号：child.kill("SIGINT") 在 win32 上等价 TerminateProcess，跑不到 JS
+// handler。这里用 PS7 复刻终端 Ctrl+C——CREATE_NEW_CONSOLE 建子进程 → 附着到该控制台 →
+// GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)。CreateProcess 前先 SetConsoleCtrlHandler(NULL,FALSE)
+// 恢复本进程的 Ctrl+C（否则子进程继承「忽略 Ctrl+C」后收不到事件）；事件发出前再 (NULL,TRUE)
+// 保护 helper 自己不被同一次 Ctrl+C 带走。子进程正常退出码经 CHILD_EXITCODE 回传。
+const SIGINT_SENDER_PS1 = `param([string]$NodeExe, [string]$Script, [string]$ScriptArg = "", [string]$ArgsFile = "", [string]$WorkDir, [string]$Marker, [int]$WaitMs = 8000)
+$ErrorActionPreference = "Stop"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class SigIntSender {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct STARTUPINFO {
+    public uint cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+    public uint dwX; public uint dwY; public uint dwXSize; public uint dwYSize; public uint dwXCountChars;
+    public uint dwYCountChars; public uint dwFillAttribute; public uint dwFlags; public ushort wShowWindow;
+    public ushort cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct PI { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; }
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern bool CreateProcessW(string app, string cmdline, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PI pi);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool GenerateConsoleCtrlEvent(uint evt, uint group);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern uint WaitForSingleObject(IntPtr h, uint ms);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool TerminateProcess(IntPtr h, uint code);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool CloseHandle(IntPtr h);
+}
+"@
+[void][SigIntSender]::SetConsoleCtrlHandler([IntPtr]::Zero, $false)
+$si = New-Object SigIntSender+STARTUPINFO
+$si.cb = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf([Type][SigIntSender+STARTUPINFO])
+$si.dwFlags = 1
+$si.wShowWindow = 0
+$pi = New-Object SigIntSender+PI
+$cmdline = '"' + $NodeExe + '" "' + $Script + '"'
+if ($ScriptArg -ne "") { $cmdline = $cmdline + ' "' + $ScriptArg + '"' }
+if ($ArgsFile -ne "") {
+  $argList = @(Get-Content -Raw -Encoding utf8 -LiteralPath $ArgsFile | ConvertFrom-Json)
+  foreach ($a in $argList) { $cmdline = $cmdline + ' "' + [string]$a + '"' }
+}
+$ok = [SigIntSender]::CreateProcessW($NodeExe, $cmdline, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0x00000010, [IntPtr]::Zero, $WorkDir, [ref]$si, [ref]$pi)
+if (-not $ok) { Write-Output ("CREATE_FAILED=" + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()); exit 2 }
+Write-Output ("CHILD_PID=" + $pi.dwProcessId)
+$deadline = (Get-Date).AddMilliseconds($WaitMs)
+while (-not (Test-Path -LiteralPath $Marker) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 25 }
+if (-not (Test-Path -LiteralPath $Marker)) {
+  [void][SigIntSender]::TerminateProcess($pi.hProcess, 1)
+  Write-Output "MARKER_TIMEOUT"
+  [void][SigIntSender]::CloseHandle($pi.hProcess); [void][SigIntSender]::CloseHandle($pi.hThread)
+  exit 3
+}
+Start-Sleep -Milliseconds 150
+[void][SigIntSender]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)
+[void][SigIntSender]::FreeConsole()
+if (-not [SigIntSender]::AttachConsole($pi.dwProcessId)) {
+  Write-Output ("ATTACH_FAILED=" + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error())
+  [void][SigIntSender]::TerminateProcess($pi.hProcess, 1)
+  [void][SigIntSender]::CloseHandle($pi.hProcess); [void][SigIntSender]::CloseHandle($pi.hThread)
+  exit 4
+}
+$sent = [SigIntSender]::GenerateConsoleCtrlEvent(0, 0)
+Write-Output ("CTRL_C_SENT=" + $sent)
+$w = [SigIntSender]::WaitForSingleObject($pi.hProcess, $WaitMs)
+$code = 0
+[void][SigIntSender]::GetExitCodeProcess($pi.hProcess, [ref]$code)
+Write-Output ("WAIT_RESULT=" + $w)
+Write-Output ("CHILD_EXITCODE=" + $code)
+if ($w -ne 0) { [void][SigIntSender]::TerminateProcess($pi.hProcess, 1) }
+[void][SigIntSender]::CloseHandle($pi.hProcess); [void][SigIntSender]::CloseHandle($pi.hThread)
+`;
+
+function waitForPath(file, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise(function (resolve) {
+    (function poll() {
+      if (fs.existsSync(file)) return resolve(true);
+      if (Date.now() >= deadline) return resolve(false);
+      setTimeout(poll, 25);
+    })();
+  });
+}
+
+// 真 Ctrl+C 跑 CLI 的中继：把 CLI 的 stdout/stderr 同时写进日志文件（helper 用 CREATE_NEW_CONSOLE
+// 建子进程，输出不进本进程的管道），再按 CLI 自己的退出码退出——等价于 shell 转交退出码。
+// 注意 SIGINT 必须被吞掉：中继和 CLI 同属一个控制台，不吞就会被同一次 Ctrl+C 带走，丢掉日志。
+const CTRL_C_RELAY_MJS = [
+  'import fs from "node:fs";',
+  'import { spawn } from "node:child_process";',
+  "const [logPath, ...args] = process.argv.slice(2);",
+  'const log = fs.openSync(logPath, "w");',
+  'process.on("SIGINT", function () {});',
+  'const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });',
+  "child.stdout.on(\"data\", function (d) { fs.writeSync(log, d); });",
+  "child.stderr.on(\"data\", function (d) { fs.writeSync(log, d); });",
+  // 'close' 一定在 stdio 全关 + 进程退出之后触发（'exit' 可能早于管道读完，退出码还没到）
+  'child.on("close", function (code, signal) {',
+  "  fs.closeSync(log);",
+  '  process.exit(code == null ? (signal === "SIGINT" ? 130 : 1) : code);',
+  "});",
+  "",
+].join("\n");
+
+// 真信号跑一次 CLI：等 helper 打印 CHILD_PID（子进程已创建）→ 可选等某个路径出现（如 --wav 的
+// 分块目录，出现即说明探测已结束、合成已开始）→ 再等 delayMs 落 marker，helper 见到 marker 后
+// 150ms 发 CTRL_C_EVENT。
+function runCliWithRealCtrlC(cliArgs, options) {
+  const opts = options || {};
+  const delayMs = opts.delayMs == null ? 1300 : opts.delayMs;
+  const waitMs = opts.waitMs == null ? 25000 : opts.waitMs;
+  const until = opts.until || null;
+  const seed = Date.now() + "-" + Math.random().toString(16).slice(2);
+  const relay = path.join(TMP, "ctl-relay-" + seed + ".mjs");
+  const logPath = relay + ".log";
+  const argsFile = relay + ".args.json";
+  const marker = relay + ".marker";
+  const sender = path.join(TMP, "sigint-sender-cli.ps1");
+  fs.writeFileSync(relay, CTRL_C_RELAY_MJS, "utf8");
+  fs.writeFileSync(sender, SIGINT_SENDER_PS1, "utf8");
+  fs.writeFileSync(argsFile, JSON.stringify([logPath].concat(cliArgs)), "utf8");
+  const started = Date.now();
+  return new Promise(function (resolve, reject) {
+    const helper = spawn(
+      "C:/Program Files/PowerShell/7/pwsh.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", sender, "-NodeExe", process.execPath, "-Script", relay, "-ArgsFile", argsFile, "-WorkDir", TMP, "-Marker", marker, "-WaitMs", String(waitMs)],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    let out = "";
+    let markerScheduled = false;
+    const guard = setTimeout(function () {
+      try {
+        helper.kill();
+      } catch {
+        /* 已退出 */
+      }
+      reject(new Error("真 Ctrl+C helper 超时（" + (waitMs + 30000) + "ms）：" + out));
+    }, waitMs + 30000);
+    function scheduleMarker() {
+      if (markerScheduled) return;
+      markerScheduled = true;
+      setTimeout(function () {
+        try {
+          fs.writeFileSync(marker, "go", "utf8");
+        } catch {
+          /* helper 已退出 */
+        }
+      }, delayMs);
+    }
+    function waitForUntil(deadline) {
+      if (!until || fs.existsSync(until)) return scheduleMarker();
+      if (Date.now() >= deadline) return scheduleMarker(); // 超时也照发，让断言把问题暴露出来
+      setTimeout(function () {
+        waitForUntil(deadline);
+      }, 20);
+    }
+    helper.stdout.on("data", function (d) {
+      out += d.toString("utf8");
+      if (markerScheduled || out.indexOf("CHILD_PID=") < 0) return;
+      waitForUntil(Date.now() + 15000);
+    });
+    helper.stderr.on("data", function (d) {
+      out += d.toString("utf8");
+    });
+    helper.on("close", function () {
+      clearTimeout(guard);
+      const codeMatch = /CHILD_EXITCODE=(\d+)/.exec(out);
+      const waitMatch = /WAIT_RESULT=(\d+)/.exec(out);
+      let log = "";
+      try {
+        log = fs.readFileSync(logPath, "utf8");
+      } catch {
+        /* CLI 没跑起来：日志不存在 */
+      }
+      resolve({
+        exitCode: codeMatch ? Number(codeMatch[1]) : null,
+        waitResult: waitMatch ? Number(waitMatch[1]) : null,
+        log: log,
+        helperOut: out,
+        elapsedMs: Date.now() - started,
+      });
+    });
+  });
+}
+
+test("edge：SIGINT 清理——子进程运行中收到真实 Ctrl+C 后独占目录不存在", async () => {
+  const fixture = path.join(TMP, "sigint-fixture.mjs");
+  const ownedMarker = path.join(TMP, "sigint-owned.txt");
+  const startedMarker = ownedMarker + ".started";
+  const cliUrl = pathToFileURL(CLI).href;
+  fs.writeFileSync(
+    fixture,
+    [
+      "import fs from \"node:fs\";",
+      "import path from \"node:path\";",
+      "import os from \"node:os\";",
+      "const mod = await import(" + JSON.stringify(cliUrl) + ");",
+      "const ownedMarker = process.argv[2];",
+      "const startedMarker = ownedMarker + \".started\";",
+      "const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), \"read-aloud-edge-\"));",
+      "fs.writeFileSync(path.join(dir, \"part001.mp3\"), \"half\", \"utf8\");",
+      "mod.installSigintCleanup();",
+      "fs.writeFileSync(ownedMarker, dir, \"utf8\");",
+      "try {",
+      "  mod.runMp3Plan({",
+      "    engine: \"edge\",",
+      "    chunks: [\"x\"],",
+      "    voice: \"test\",",
+      "    dir: dir,",
+      "    ownsDir: true,",
+      "    commands: [{",
+      "      command: process.execPath,",
+      "      args: [\"-e\", \"require('fs').writeFileSync(process.argv[1], 'x'); setTimeout(function () {}, 30000)\", startedMarker],",
+      "      out: path.join(dir, \"part002.mp3\"),",
+      "    }],",
+      "  });",
+      "  process.stdout.write(\"fixture: completed\\n\");",
+      "} catch (err) {",
+      "  if (!(err && err.interrupted)) throw err;",
+      "  fs.writeFileSync(ownedMarker + \".interrupted\", \"1\", \"utf8\");",
+      "  process.stdout.write(\"speak: 已中断\\n\");",
+      "}",
+      // 与 CLI 入口一致：留一圈 0ms 定时器，让排队的 SIGINT 回调在自然退出前得到派发。
+      "setTimeout(function () {}, 0);",
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+
+  let exitCode = null;
+  if (process.platform === "win32") {
+    const sender = path.join(TMP, "sigint-sender.ps1");
+    fs.writeFileSync(sender, SIGINT_SENDER_PS1, "utf8");
+    const result = spawnSync(
+      "C:/Program Files/PowerShell/7/pwsh.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", sender, "-NodeExe", process.execPath, "-Script", fixture, "-ScriptArg", ownedMarker, "-WorkDir", TMP, "-Marker", startedMarker],
+      { encoding: "utf8", timeout: 60000 }
+    );
+    assert.equal(result.status, 0, "真实 Ctrl+C helper 应正常结束：" + String(result.stdout || "") + String(result.stderr || ""));
+    const match = /CHILD_EXITCODE=(\d+)/.exec(String(result.stdout || ""));
+    assert.ok(match, "helper 输出里应有 CHILD_EXITCODE：" + String(result.stdout || ""));
+    exitCode = Number(match[1]);
+  } else {
+    const child = spawn(process.execPath, [fixture, ownedMarker], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      assert.ok(await waitForPath(startedMarker, 10000), "慢命令应在超时前启动");
+      process.kill(-child.pid, "SIGINT"); // 负 pid：整个前台进程组，等价终端 Ctrl+C
+      exitCode = await new Promise(function (resolve) {
+        child.on("exit", function (code, signal) {
+          resolve(code == null ? signal : code);
+        });
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        /* 已退出 */
+      }
+    }
+  }
+
+  assert.equal(exitCode, 130, "SIGINT 应按 130 退出（128+SIGINT），实际 " + exitCode);
+  assert.equal(fs.existsSync(ownedMarker + ".interrupted"), true, "必须是 interrupted 路径（不得回落/崩成其它错误）");
+  const ownedDir = fs.readFileSync(ownedMarker, "utf8");
+  assert.ok(ownedDir.indexOf("read-aloud-edge-") >= 0, "标记文件应记录本计划的独占目录");
+  assert.equal(fs.existsSync(ownedDir), false, "Ctrl+C 后独占目录（含半截分块）必须不存在: " + ownedDir);
+});
+
 
 test("speak：默认引擎 edge 不可用（ENOENT）时回落 sapi 并在 stderr 提示", () => {
   const outcome = captureStderr(() => buildSpeakPlan("【用户】你好。", { rate: 0, spawn: missingEdgeSpawn() }));
@@ -857,6 +1224,270 @@ test("speak：spawnSync 失败（如 PS7 缺失）时 fail-closed，不把 FAIL 
     /无法启动 PowerShell 7/
   );
   assert.ok(!fs.existsSync(wavPath), "spawn 失败路径不得产出 wav");
+});
+
+test("sapi：--wav 被 Ctrl+C 打断按中断返回（不是「没有完整的分块 wav 可合并」），并回收本次新建的分块目录", () => {
+  const dir = fs.mkdtempSync(path.join(TMP, "sapi-int-"));
+  const wavPath = path.join(dir, "out.wav");
+  const plan = buildSpeakPlan("【用户】你好。世界。", { engine: "sapi", rate: 0, wav: wavPath });
+  const calls = [];
+  const outcome = runSapi(plan, (command, args) => {
+    calls.push(command);
+    assert.equal(command, plan.command, "中断后不得继续调用 ffmpeg");
+    // 模拟 PowerShell 已写出一块完成分块后被打断（分块目录里留下半成品）
+    const wavDir = args[args.indexOf("-WavDir") + 1];
+    fs.mkdirSync(wavDir, { recursive: true });
+    fs.writeFileSync(path.join(wavDir, "chunk_001.wav"), makeWavBytes(8820, 44100, 8820));
+    return { status: 3221225786, signal: null };
+  });
+  assert.deepEqual(outcome, { interrupted: true, status: 3221225786 }, "STATUS_CONTROL_C_EXIT 必须走 isInterruptedResult 的中断分支");
+  assert.deepEqual(calls, [plan.command], "中断即返回，不合并半截分块");
+  assert.equal(fs.existsSync(plan.wavDir), false, "中断后本次新建的分块目录必须回收（不留残留目录）");
+  assert.equal(fs.existsSync(wavPath), false, "中断不得产出目标 wav");
+});
+
+test("sapi：非中断的非零退出是失败，不冒充「已中断」（isInterruptedResult 是唯一中断判据）", () => {
+  const plan = buildSpeakPlan("【用户】你好。", { engine: "sapi", rate: 0 });
+  assert.throws(() => runSapi(plan, () => ({ status: 1, signal: null })), /朗读未正常完成/);
+});
+
+// 阻断级回归（2026-11-10 终验收复核）：PS7 用 -File 跑脚本、被 Ctrl+C 停掉时退出码是 **0**，
+// 不是 0xC000013A——旧实现只认 isInterruptedResult，于是 SAPI 路径的中断永远漏判（落进
+// 「没有完整的分块 wav 可合并」→ die(1)，或直接报「朗读完成」）。现在改看完成度哨兵：
+// 实际完成块数（manifest 行数）与计划块数比对，没跑满且退出码干净即判中断。
+test("sapi：完成度哨兵——退出码为 0 但分块没跑满必须判中断（PS7 -File 的实机退出码就是 0）", () => {
+  const plan = buildSpeakPlan("【用户】你好。世界。", { engine: "sapi", rate: 0 });
+  assert.equal(plan.chunks.length, 2, "夹具应是 2 块");
+  // 纯判定：优先级「中断 > 失败」，跑满才算 ok
+  assert.equal(classifySapiCompletion({ status: 0, signal: null }, 1, 2), "interrupted", "退出码 0 + 只完成 1/2 块 = 被信号停掉");
+  assert.equal(classifySapiCompletion({ status: 0, signal: null }, 0, 2), "interrupted");
+  assert.equal(classifySapiCompletion({ status: 0, signal: null }, 2, 2), "ok");
+  assert.equal(classifySapiCompletion({ status: 1, signal: null }, 1, 2), "failed", "非零退出是脚本报错，不许冒充中断");
+  assert.equal(classifySapiCompletion({ status: 3221225786, signal: null }, 2, 2), "interrupted", "STATUS_CONTROL_C_EXIT 照旧认中断");
+  assert.equal(classifySapiCompletion({ status: null, signal: "SIGINT" }, 0, 2), "interrupted", "POSIX SIGINT 照旧认中断");
+
+  // 直接发声（无 --wav）没有产物可看，全靠 manifest 行数：只写 1 行 = 只念完 1 块
+  const partial = runSapi(plan, (command, args) => {
+    assert.ok(args.indexOf("-Manifest") > 0, "直接发声也必须带 -Manifest（哨兵载体）");
+    fs.writeFileSync(args[args.indexOf("-Manifest") + 1], "1\n", "utf8");
+    return { status: 0, signal: null };
+  });
+  assert.deepEqual(partial, { interrupted: true, status: 0 }, "旧实现这里会返回 interrupted:false 并打印「朗读完成」");
+  // 跑满 → 正常完成（哨兵不能把成功误判成中断）
+  const ok = runSapi(plan, (command, args) => {
+    fs.writeFileSync(args[args.indexOf("-Manifest") + 1], "1\n2\n", "utf8");
+    return { status: 0, signal: null };
+  });
+  assert.deepEqual(ok, { interrupted: false, status: 0 });
+  // 非零退出 + 没跑满 = 失败（不是中断）：中断只在退出码干净时才成立
+  assert.throws(
+    () =>
+      runSapi(plan, (command, args) => {
+        fs.writeFileSync(args[args.indexOf("-Manifest") + 1], "1\n", "utf8");
+        return { status: 1, signal: null };
+      }),
+    /朗读未正常完成/
+  );
+});
+
+test("sapi：语音探测被停掉（退出码 0 但没有哨兵行）→ 按中断收口，不再整段开念", () => {
+  // 探测（-Command）返回「干净退出 + 零输出」= 枚举脚本没跑到最后一行就被 Ctrl+C 停掉。
+  // 旧实现把 sapiPlan 里的一切探测错误都吞掉，于是接着把全文念完（实机 19.2s 全部念完）。
+  const dir = fs.mkdtempSync(path.join(TMP, "sapi-probe-int-"));
+  const textFile = path.join(dir, "text.txt");
+  fs.writeFileSync(textFile, "【用户】你好。世界。", "utf8");
+  const stub = path.join(dir, "stub.cjs");
+  fs.writeFileSync(
+    stub,
+    [
+      'const cp = require("node:child_process");',
+      "cp.spawnSync = function () {",
+      '  return { status: 0, signal: null, stdout: "", stderr: "" };',
+      "};",
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+  const result = spawnSync(process.execPath, ["--require", stub, CLI, "speak", textFile, "--engine", "sapi"], { encoding: "utf8" });
+  assert.equal(result.status, 130, "探测窗中断应按 130 退出（128+SIGINT），实际 " + result.status + "；stderr=" + result.stderr);
+  assert.match(result.stdout, /speak: 已中断/, "必须打印统一的「已中断」");
+  assert.ok(result.stdout.indexOf("sapi 朗读完成") < 0, "探测已中断就不许再报朗读完成");
+  assert.ok(result.stdout.indexOf("[1/2]") < 0, "探测已中断就不许继续开念");
+});
+
+// 真信号 (a)：--wav 合成中途收到真实 CTRL_C_EVENT。旧实现 exit 1 + stderr「没有完整的分块 wav
+// 可合并」+ 分块目录残留；现在必须 exit 130 + speak: 已中断 + 无目标 wav + 无分块残留。
+test("sapi：--wav 合成中途真 Ctrl+C → exit 130 + 已中断 + 无目标 wav + 分块目录不残留", async () => {
+  const dir = fs.mkdtempSync(path.join(TMP, "sapi-wav-real-"));
+  const textFile = path.join(dir, "text.txt");
+  const sentence = "这是一段用于实机验证中断行为的朗读文本，句子长度接近分块上限，用来保证每一块都要合成一会儿。";
+  fs.writeFileSync(textFile, Array.from({ length: 20 }, (_, i) => "【用户】" + (i + 1) + "、" + sentence + sentence).join("\n"), "utf8");
+  const wavPath = path.join(dir, "out.wav");
+  const partsDir = path.join(dir, "read-aloud-parts");
+  // 分块目录由 runSapi 在「探测之后、spawn pwsh 之前」建好：等它出现再等 400ms 发信号，
+  // 保证中断落在合成中途（40 块约 7s，400ms 时在第 2-3 块），不会误落进探测窗。
+  const run = await runCliWithRealCtrlC([CLI, "speak", textFile, "--engine", "sapi", "--wav", wavPath], { delayMs: 400, waitMs: 25000, until: partsDir });
+  assert.equal(run.waitResult, 0, "Ctrl+C 后 CLI 必须在等待窗内退出，否则仍在中途：\n" + run.helperOut);
+  assert.equal(run.exitCode, 130, "中断应按 130 退出（128+SIGINT），实际 " + run.exitCode + "；log=" + run.log);
+  assert.match(run.log, /speak: 已中断/, "中断必须打印统一提示（不是「合成失败」）");
+  assert.ok(run.log.indexOf("没有完整的分块 wav") < 0, "不得再落回「合成失败」的兜底错误");
+  assert.ok(run.log.indexOf("sapi 已合成") < 0, "中断不得报成合成成功");
+  assert.equal(fs.existsSync(wavPath), false, "中断不得产出目标 wav");
+  assert.equal(fs.existsSync(partsDir), false, "中断后分块目录（含半截 chunk_*.wav）必须回收：" + (fs.existsSync(partsDir) ? fs.readdirSync(partsDir).join(",") : ""));
+});
+
+// 真信号 (b)：直发声在探测窗内被打断。旧实现吞掉探测错误后照样整段念完（实机 19.2s 念完 5 块，
+// 只在最后被排队的 SIGINT handler 补一个 130）——「已中断」与「朗读完成」同时出现。
+test("sapi：直发声在探测窗内真 Ctrl+C → 不得念完整段（无朗读完成 / 无末块标记）", async () => {
+  const dir = fs.mkdtempSync(path.join(TMP, "sapi-direct-real-"));
+  const textFile = path.join(dir, "text.txt");
+  const sentence = "这是一段用于实机验证中断行为的朗读文本，句子长度接近分块上限，用来保证每一块都要念十几秒。";
+  const text = Array.from({ length: 4 }, (_, i) => "【用户】" + (i + 1) + "、" + sentence + sentence).join("\n");
+  fs.writeFileSync(textFile, text, "utf8");
+  const chunks = buildSpeakPlan(text, { engine: "sapi", rate: 0 }).chunks.length; // 只取块数（会跑一次真探测）
+  // 500ms 发信号：node 启动 + SIGINT handler 已就绪（太早会落到 OS 默认终止，拿不到 130），
+  // 又远在整段念完之前（8 块约 90s）。落点可能在探测窗、也可能在第一块，两种都必须中断收口。
+  const run = await runCliWithRealCtrlC([CLI, "speak", textFile, "--engine", "sapi"], { delayMs: 500, waitMs: 30000 });
+  assert.equal(run.waitResult, 0, "Ctrl+C 后 CLI 必须在等待窗内退出（整段念完要好几分钟）：\n" + run.helperOut);
+  assert.equal(run.exitCode, 130, "中断应按 130 退出，实际 " + run.exitCode + "；log=" + run.log);
+  assert.ok(run.log.indexOf("朗读完成") < 0, "探测窗中断后绝不许再报「朗读完成」：" + run.log);
+  assert.ok(run.log.indexOf("[" + chunks + "/" + chunks + "]") < 0, "不得把最后一块也念完（" + chunks + " 块）：" + run.log);
+});
+
+test("sapi：ffmpeg 合并阶段被 Ctrl+C 打断也归为中断，不报「ffmpeg 合并失败」", () => {
+  // ffmpegConcatWav 直接用模块级 spawnSync，runSapi 的注入参数够不到它；
+  // 改在 CLI 子进程里用 --require 全局替换 spawnSync（pwsh 正常跑满全部块，ffmpeg 返回中断码）。
+  const dir = fs.mkdtempSync(path.join(TMP, "sapi-ff-int-"));
+  const textFile = path.join(dir, "text.txt");
+  fs.writeFileSync(textFile, "【用户】你好。世界。", "utf8");
+  const wavPath = path.join(dir, "out.wav");
+  const template = path.join(dir, "template.wav");
+  fs.writeFileSync(template, makeWavBytes(8820, 44100, 8820));
+  const stub = path.join(dir, "stub.cjs");
+  fs.writeFileSync(
+    stub,
+    [
+      'const cp = require("node:child_process");',
+      'const fs = require("node:fs");',
+      "const template = process.env.RA_STUB_WAV;",
+      "cp.spawnSync = function (command, args) {",
+      '  if (/ffmpeg$/i.test(String(command))) return { status: 3221225786, signal: null, stdout: "", stderr: "" };',
+      '  if (/pwsh\\.exe$/i.test(String(command))) {',
+      '    if (args.indexOf("-Command") >= 0) {', // 语音枚举探测：哨兵行必须齐全，否则会先判中断
+      '      return { status: 0, signal: null, stdout: "Microsoft Huihui Desktop|zh-CN|Female|Adult\\n__READ_ALOUD_VOICES_DONE__\\n", stderr: "" };',
+      "    }",
+      '    const wavDir = args[args.indexOf("-WavDir") + 1];',
+      '    const manifest = args[args.indexOf("-Manifest") + 1];',
+      "    fs.mkdirSync(wavDir, { recursive: true });",
+      "    // 完成度哨兵要求「manifest 行数 === 计划块数」，否则会被判成中断（到不了 ffmpeg）",
+      "    const lines = [];",
+      "    for (let i = 1; i <= 2; i++) {",
+      '      const chunk = wavDir + "\\\\chunk_" + String(i).padStart(3, "0") + ".wav";',
+      "      fs.copyFileSync(template, chunk);",
+      "      lines.push(chunk);",
+      "    }",
+      '    fs.writeFileSync(manifest, lines.join("\\n") + "\\n", "utf8");',
+      '    return { status: 0, signal: null, stdout: "", stderr: "" };',
+      "  }",
+      '  return { status: 0, signal: null, stdout: "", stderr: "" };',
+      "};",
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+  const result = spawnSync(process.execPath, ["--require", stub, CLI, "speak", textFile, "--engine", "sapi", "--wav", wavPath], {
+    encoding: "utf8",
+    env: Object.assign({}, process.env, { RA_STUB_WAV: template }),
+  });
+  assert.equal(result.status, 130, "ffmpeg 阶段中断应按 130 退出，实际 " + result.status + "；stderr=" + result.stderr);
+  assert.match(result.stdout, /speak: 已中断/, "ffmpeg 中断必须走统一的「已中断」提示");
+  assert.ok(result.stdout.indexOf("ffmpeg 合并失败") < 0, "不得把中断报成合并失败");
+  assert.equal(fs.existsSync(path.join(dir, "read-aloud-parts")), false, "ffmpeg 阶段中断同样回收本次新建的分块目录");
+});
+
+// 子进程级中断桩：--require 预载 CJS 补丁，把 spawnSync 换成「指定阶段返回 STATUS_CONTROL_C_EXIT」。
+// 这样不用真发 Ctrl+C 也能走完整 CLI 退出路径；真实信号路径由上面的 SIGINT 测试覆盖。
+test("sapi：CLI 收到 Ctrl+C（子进程回传 STATUS_CONTROL_C_EXIT）→ 打印 speak: 已中断 + exit 130", () => {
+  const dir = fs.mkdtempSync(path.join(TMP, "sapi-cli-int-"));
+  const textFile = path.join(dir, "text.txt");
+  fs.writeFileSync(textFile, "【用户】你好。世界。", "utf8");
+  const wavPath = path.join(dir, "out.wav");
+  const stub = path.join(dir, "stub.cjs");
+  // 探测阶段（-Command）正常返回（含完成哨兵），中断落在朗读阶段（-File），走 runSapi 的中断分支。
+  fs.writeFileSync(
+    stub,
+    [
+      'const cp = require("node:child_process");',
+      "cp.spawnSync = function (command, args) {",
+      '  if (args && args.indexOf("-Command") >= 0) {',
+      '    return { status: 0, signal: null, stdout: "Microsoft Huihui Desktop|zh-CN|Female|Adult\\n__READ_ALOUD_VOICES_DONE__\\n", stderr: "" };',
+      "  }",
+      '  return { status: 3221225786, signal: null, stdout: "", stderr: "" };',
+      "};",
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+  const result = spawnSync(process.execPath, ["--require", stub, CLI, "speak", textFile, "--engine", "sapi", "--wav", wavPath], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 130, "中断应按 130 退出（128+SIGINT），实际 " + result.status + "；stderr=" + result.stderr);
+  assert.match(result.stdout, /speak: 已中断/, "必须打印与 edge 路径同一句提示");
+  assert.ok(result.stdout.indexOf("没有完整的分块 wav 可合并") < 0, "不得再落回「合成失败」的兜底错误");
+  assert.ok(result.stdout.indexOf("sapi 朗读完成") < 0, "中断不得报成朗读完成");
+  assert.equal(fs.existsSync(path.join(dir, "read-aloud-parts")), false, "中断后分块目录必须回收");
+  assert.equal(fs.existsSync(wavPath), false, "中断不得产出目标 wav");
+  // 无 --wav（直接发声）同样是中断收口：此前会打印「已中断」但退出码 0，现在统一为 130。
+  const direct = spawnSync(process.execPath, ["--require", stub, CLI, "speak", textFile, "--engine", "sapi"], { encoding: "utf8" });
+  assert.equal(direct.status, 130, "直接发声模式的中断也应按 130 退出，实际 " + direct.status);
+  assert.match(direct.stdout, /speak: 已中断/);
+  assert.ok(direct.stdout.indexOf("sapi 朗读完成") < 0, "中断不得报成朗读完成");
+});
+
+test("edge：播放阶段被 Ctrl+C 打断也打印 speak: 已中断并按 130 退出（与合成阶段一致）", () => {
+  const dir = fs.mkdtempSync(path.join(TMP, "edge-play-int-"));
+  const textFile = path.join(dir, "text.txt");
+  fs.writeFileSync(textFile, "【用户】你好。世界。", "utf8");
+  const template = path.join(dir, "template.wav");
+  fs.writeFileSync(template, makeWavBytes(8820, 44100, 8820));
+  const stub = path.join(dir, "stub.cjs");
+  // 桩按阶段分流：edge-tts 探测/合成与 ffmpeg 转码成功（写出产物），pwsh 播放返回中断码。
+  fs.writeFileSync(
+    stub,
+    [
+      'const cp = require("node:child_process");',
+      'const fs = require("node:fs");',
+      "const template = process.env.RA_STUB_WAV;",
+      "cp.spawnSync = function (command, args) {",
+      '  const name = String(command);',
+      '  if (/edge-tts$/i.test(name)) {',
+      '    if (args.indexOf("--version") >= 0) return { status: 0, signal: null, stdout: "edge-tts 6.1.0\\n", stderr: "" };',
+      '    fs.writeFileSync(args[args.indexOf("--write-media") + 1], "ID3", "utf8");',
+      '    return { status: 0, signal: null, stdout: "", stderr: "" };',
+      "  }",
+      '  if (/ffmpeg$/i.test(name)) {',
+      "    fs.copyFileSync(template, args[args.length - 1]);",
+      '    return { status: 0, signal: null, stdout: "", stderr: "" };',
+      "  }",
+      '  if (/pwsh\\.exe$/i.test(name)) return { status: 3221225786, signal: null, stdout: "", stderr: "" };',
+      '  return { error: new Error("unexpected spawn: " + name), status: null, signal: null };',
+      "};",
+      "",
+    ].join("\n"),
+    "utf8"
+  );
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  const before = new Set(fs.readdirSync(tmpRoot).filter((name) => name.indexOf("read-aloud-edge-") === 0));
+  const result = spawnSync(process.execPath, ["--require", stub, CLI, "speak", textFile, "--engine", "edge"], {
+    encoding: "utf8",
+    env: Object.assign({}, process.env, { RA_STUB_WAV: template }),
+  });
+  assert.equal(result.status, 130, "播放阶段中断应按 130 退出，实际 " + result.status + "；stderr=" + result.stderr);
+  assert.match(result.stdout, /正在播放/, "应先进入播放阶段");
+  assert.match(result.stdout, /speak: 已中断/, "播放阶段中断必须打印统一提示");
+  assert.ok(result.stdout.indexOf("播放完成") < 0, "中断不得报成播放完成");
+  const leftovers = fs.readdirSync(tmpRoot).filter((name) => name.indexOf("read-aloud-edge-") === 0 && !before.has(name));
+  assert.deepEqual(leftovers, [], "播放中断后不得留下独占分块目录");
 });
 
 test("speak/dump/widget：取值型标志缺值时当场报错，不把 true 泄漏进命令行", async () => {

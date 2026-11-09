@@ -251,7 +251,19 @@ function evictCacheFile(p) {
 // 原子落盘：临时文件先 fsync 再同目录 rename 到最终缓存位（同卷 rename 原子，外部永远
 // 看不到半截文件）。fsync 只影响掉电后的持久性，Windows 的 FlushFileBuffers 偶发 EPERM，
 // 失败不应把已合成成功的音频判死——原子性由 rename 保证，故这里容忍 fsync 失败。
-function flushThenRename(partFile, finalFile) {
+//
+// rename 竞争重试（2026-11-09 收尾）：跨进程并发写同一缓存 key 时（同 key 去重只在单进程
+// 的 inflightSynth 内生效），另一进程可能正持最终路径的读句柄；Windows 上 Node 自身打开的
+// 句柄带 FILE_SHARE_DELETE 可被 rename 直接替换，但杀毒/索引器等外部句柄会 EPERM/EBUSY，
+// 属瞬时竞争而非真失败，有界重试后再抛。重试期间目标位保持上一次完整版本，不破坏缓存。
+const RENAME_RETRY_ATTEMPTS = 5;
+const RENAME_RETRY_BASE_MS = 40;
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function flushThenRename(partFile, finalFile) {
   try {
     const fd = openSync(partFile, "r+");
     try {
@@ -260,7 +272,17 @@ function flushThenRename(partFile, finalFile) {
       try { closeSync(fd); } catch { /* ignore */ }
     }
   } catch { /* 忽略：见上方注释 */ }
-  renameSync(partFile, finalFile);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(partFile, finalFile);
+      return;
+    } catch (e) {
+      const code = e && e.code;
+      const transient = code === "EPERM" || code === "EACCES" || code === "EBUSY";
+      if (!transient || attempt >= RENAME_RETRY_ATTEMPTS) throw e;
+      await sleepMs(RENAME_RETRY_BASE_MS * attempt);
+    }
+  }
 }
 
 // Windows 上被杀子进程的文件句柄释放有延迟，单次 rm 可能 EBUSY/EPERM，需有界重试。
@@ -318,7 +340,8 @@ function runProcess(label, exe, args, timeoutMs) {
 // edge 合成与 SAPI 路径同款原子写：先写 .part 临时文件，子进程成功退出后 fsync + 原子改名到
 // 最终缓存位。直写最终路径时，超时 SIGKILL / 中途失败会留下半截 mp3 永久占据该缓存 key，
 // 被 existsSync 当有效缓存命中并永久遮蔽 SAPI 兜底 wav（P0-2 评审修复）。
-async function synthesizeEdge(text, voice, rateArg, mp3) {
+// 导出供单测直调（回归「rename 前失败不破坏既有缓存、无 .part 残留」，见 server.test.mjs）。
+export async function synthesizeEdge(text, voice, rateArg, mp3) {
   const { path: python } = await resolvePython();
   const partFile = mp3 + "." + process.pid + "." + Math.random().toString(16).slice(2, 10) + ".part.mp3";
   try {
@@ -327,7 +350,7 @@ async function synthesizeEdge(text, voice, rateArg, mp3) {
     // 退出码 0 不等于有产物：空文件不得进缓存（否则首响就是空音频，且下次才被大小校验清掉）。
     const produced = existsSync(partFile) ? statSync(partFile).size : 0;
     if (produced <= 0) throw new Error("合成未产出有效 mp3 文件");
-    flushThenRename(partFile, mp3);
+    await flushThenRename(partFile, mp3);
   } finally {
     // 失败/超时路径必须清掉临时文件，绝不把半截内容留在缓存命名空间里。
     await removeTempFileWithRetry(partFile);
@@ -424,10 +447,12 @@ async function synthesizeSapi(text, edgeVoice, rate, outFile) {
     });
     await runProcess("SAPI（PowerShell 7）", ps7, args, SAPI_TIMEOUT_MS);
     if (!existsSync(partFile)) throw new Error("合成未产出 wav 文件");
-    renameSync(partFile, outFile);
+    // 与 edge 路径同款：fsync + 原子改名（2026-11-09 收尾，原为裸 renameSync 无 fsync）。
+    await flushThenRename(partFile, outFile);
   } finally {
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    try { if (existsSync(partFile)) rmSync(partFile, { force: true }); } catch { /* ignore */ }
+    // PS7 被 SIGKILL 后句柄释放有延迟，单次 rm 可能 EBUSY/EPERM，与 edge 路径同款有界重试。
+    await removeTempFileWithRetry(partFile);
   }
 }
 

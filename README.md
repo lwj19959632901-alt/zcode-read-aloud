@@ -235,17 +235,27 @@ node read-aloud.mjs voices
 | 场景 | `edge` | `sapi`（离线兜底） |
 | --- | --- | --- |
 | 面板 `speak_chunk` | 正常路径：mp3 → `data:audio/mpeg` | **edge 合成失败即自动回退**：PS7 `System.Speech` 写 wav → `data:audio/wav`，响应 `engine:"sapi"`；SAPI 再失败则报「edge 失败 + SAPI 兜底失败」双错 |
-| CLI `speak`（默认） | 首选 | 仅**引擎不可用**类错误自动回落（未装 `edge-tts`/启动失败、`edge-tts` 退出码非 0（含网络失败）、缺 `ffmpeg`）；显式 `--engine edge` 时 fail-closed 不回落 |
+| CLI `speak`（默认） | 首选 | 仅**引擎不可用**类错误自动回落（未装 `edge-tts`/启动失败、`edge-tts` 退出码非 0（含网络失败）、缺 `ffmpeg`）；**Ctrl+C 中断不回落**（否则用户按了 Ctrl+C 还会改用 sapi 把全文再念一遍）；显式 `--engine edge` 时 fail-closed 不回落 |
 | 音色映射 | 8 个中文神经音色（`--voice` 全名/短名） | `sapiVoiceHint` 按性别就近：男声 4 个 → `Kangkang`，其余 → `Huihui`；PS 侧找不到则用系统默认音色 |
 | 依赖 | Python + `edge_tts` + 联网 | Windows + PowerShell 7 全路径（`C:/Program Files/PowerShell/7/pwsh.exe`） |
 | 缓存 | `<sha256>.mp3` | `<sha256>.wav`（命中直接复用；edge 恢复后下次仍先试 edge） |
 
 > 说明：面板当前**不单独提示**已回退 SAPI（响应里有 `engine` 字段，UI 未展示）；音色下拉仍是 edge 名，SAPI 侧按性别就近映射。本节的 SAPI 兜底以**源码目录**为准——宿主 `cache` 里的已安装副本可能滞后于源码，更新需按文末「更新提示」回拷后重启。
 
+> **缓存原子写（评审 high 遗留项，2026-11-09 已修复）**：缓存位（`<sha256>.mp3` / `<sha256>.wav`）落盘一律走
+> 「同目录唯一 `.part` 临时文件（pid+随机后缀）→ 合成成功后 fsync → 原子 rename 替换」；失败/超时清理临时文件，
+> 绝不留半截文件占据缓存 key 遮蔽 SAPI 兜底（直写最终路径时被 SIGKILL 就会留下这种毒缓存）。edge 与 SAPI 两条
+> 路径同款（`flushThenRename`），rename 撞上瞬时句柄竞争（Windows EPERM/EBUSY）有界重试；跨进程并发写同一 key
+> 由 rename 原子性保证最终文件必为某一次合成的完整内容。回归：`server.test.mjs`「原子写」5 条（直调失败/超时/
+> 成功替换 + flushThenRename 直测 + 双进程并发同 key）。
+
 ### 停止语义
 
 - **面板**：停止 = `Audio.pause()` + `runId++`（在途响应与预取缓存按 `runId` 校验后丢弃，不再发新块）。面板**不发取消信号**，服务端已启动的合成不会被停止打断（只有超时才 SIGKILL：edge 120s / SAPI 60s）；单块 ≤120 字、最坏约 20-30 秒，该块会合成完落进磁盘缓存后静默丢弃（无害，下次命中缓存）。
-- **CLI**：无 `--wav` 时 Ctrl+C 可中途停（`stdio: 'inherit'` 直通）；`--wav` 时正在合成的那块不在 `manifest.txt` 里，不参与合并（其 wav 头未 finalize），已完成的块仍可合并。
+- **CLI**：无 `--wav` 时 Ctrl+C 可中途停（`stdio: 'inherit'` 直通）；`--wav` 时中断即整次作废——不产出目标 wav，本次运行写在 `read-aloud-parts/` 里的 `chunk_NNN.wav` 与目录一并回收（成功路径仍保留分块，供事后核对）。
+- **退出码**：`0` 成功 / `1` 普通错误 / `2` 参数错误 / **`130` 用户中断（128+SIGINT）**。合成/朗读阶段中断时 stdout 打印 `speak: 已中断`（绝不出现「朗读完成」或「合成失败」）；Ctrl+C 落在语音枚举探测窗内则直接按 130 退出、根本不开念（什么都没说，也就不打印完成提示）。
+- **SAPI 中断的判定依据是完成度哨兵，不是退出码**：PS7 用 `-File` 跑脚本、被 Ctrl+C 停掉时退出码是 **0**（不是 `0xC000013A`），所以比「实际完成块数（manifest 行数）vs 计划块数」——没跑满且退出码干净才判中断；非零退出仍按失败报（不冒充中断）。探测侧同理：枚举脚本最后一行 `__READ_ALOUD_VOICES_DONE__` 缺失即「探测没跑完」。
+- **中断延迟**：`System.Speech` 的 `Speak()` 是整块阻塞的，Ctrl+C 打进去要等**当前块**念完才生效（块 ≤120 字，直发声约十几秒）；`--wav` 合成远快于实时，感知上接近立即停。
 
 ### 倍速上限
 
@@ -273,6 +283,7 @@ CLI 的 `--rate` 范围 `-10..10`，按 5 的步长映射到同一组百分比�
 | **默认会话会取错** | 多窗口并行时，不带 `--session` 的 `dump` 取到另一个窗口的会话且不报错 | 用 `--session-by-text` 指纹定位或显式 `--session`，详见「会话定位」一节 |
 | **`speak` 只吃文件** | 没有直传文本 / stdin 的入口 | 正文先写进文件（**绝对 Windows 路径**，Git Bash 里的 `/tmp/...` 会被 MSYS 改写）再 `speak <文件>` |
 | **PowerShell 单元素数组退化** | `ConvertFrom-Json` 对**单元素** JSON 数组会摊平成标量，`$chunks[0]` 取到的是**第一个字符**——只念一个字，退出码还是 0（静默坏） | 解析 JSON 数组一律用 `@(...)` 包住（`$chunks = @(… \| ConvertFrom-Json)`），保证数组语义；本仓的 PS 脚本已按此写并有单测回归 |
+| **PS7 被 Ctrl+C 停掉时退出码是 0** | `pwsh -File script.ps1` 被用户中断时，**退出码是 0，不是 `0xC000013A`**（2026-11-10 实机复核），只看退出码的中断判定在 SAPI 路径永远漏判：要么落进「合成失败」报 exit 1，要么照样报「朗读完成」 | 判中断一律看**完成度哨兵**：PS 侧每完成一块往 `manifest.txt` 追一行（枚举脚本则输出 `__READ_ALOUD_VOICES_DONE__`），行数 < 计划块数且退出码干净 = 中断；单测里有真 Ctrl+C 用例（`SIGINT_SENDER_PS1` + P/Invoke `GenerateConsoleCtrlEvent`），不靠桩 |
 
 ## 设计说明
 
@@ -295,9 +306,13 @@ PS7 侧 `Get-Content -Raw -Encoding utf8` 读取。
 
 - `SetOutputToWaveFile` **只落盘不播音**（实测确认）；每块一个 `chunk_NNN.wav`，ffmpeg concat 合并。
 - 每块合成成功后，PS 侧把该 wav 路径追加进 `manifest.txt`；Node 只合并 manifest 里的块。
-- **Ctrl+C 中断时，正在合成的那一块不在 manifest 里**（其 wav 头未 finalize，合并会吃到损坏音频），
-  因此不会被合并；已干净结束的块仍可合并。Node 侧还会再校验每个 wav 的 RIFF 头与 data 尺寸，残缺块跳过并告警。
-- 无 `--wav` 时直接发声，Ctrl+C 可中途停（`stdio: 'inherit'` 直通）。
+  这份清单同时是**完成度哨兵**：行数 < 计划块数 = 本次没跑满（直接发声模式也写，只是记录块号）。
+- **Ctrl+C 中断 = 整次作废**：不合并任何分块、不产出目标 wav，本次写进分块目录的
+  `chunk_NNN.wav` 与目录一并回收（只删本程序自己的文件名，同目录用户文件不碰）。
+  中断判定看「块数跑满没跑满 + 退出码是否干净」，不看退出码是否等于 `0xC000013A`——PS7 被
+  Ctrl+C 停掉时退出码是 0。Node 侧仍会校验每个 wav 的 RIFF 头与 data 尺寸，残缺块跳过并告警。
+- 每次运行开始前先清掉上次残留的 `chunk_NNN.wav`（只在 `--wav` 目录里按自己的名字清理）。
+- 无 `--wav` 时直接发声，Ctrl+C 在**当前块**念完后生效（`Speak()` 整块阻塞）。
 
 ### SAPI 与浏览器语音表的差异
 
@@ -339,7 +354,14 @@ AI Agent 会话库里混着大量**非对话内容**：系统提示词、deferre
 ```bash
 node --check read-aloud.mjs
 node --check read-aloud.test.mjs
-node --test read-aloud.test.mjs        # 35 条全绿
+node --test read-aloud.test.mjs        # 57 条全绿（含 2 条真 CTRL_C_EVENT 用例）
+```
+
+全量（CLI + 本地市场插件，共 156 条）：
+
+```bash
+node --test read-aloud.test.mjs marketplace-local/read-aloud/test/core.test.mjs \
+  marketplace-local/read-aloud/test/panel.test.mjs marketplace-local/read-aloud/test/server.test.mjs
 ```
 
 手动冒烟（Windows）：
@@ -395,6 +417,8 @@ python smoke_widget.py <standalone.html>
 **PS 分块清单 `@()` 包裹回归**（单元素数组退化）、
 句子分块器（中文标点/超长二次切分/无空块）、widget 生成（HTML 转义/根 id/无 fetch/XHR/内联脚本 `node --check`）、
 `speak --dry-run` 命令构造（sapi/minimax）、spawn 失败 fail-closed（注入 mock spawnSync，不真调 PS7）、
+**SAPI 完成度哨兵**（退出码 0 但块数没跑满 → 中断；探测缺哨兵行 → 中断；非零退出不冒充中断）、
+**真 Ctrl+C 两组**（`--wav` 合成中途 → exit 130 + 无目标 wav + 分块目录不残留；直发声探测窗内 → 不念完整段）、
 取值型参数缺值报错、wav 头解析、voices 选择，
 以及 **widget 交互冒烟**（vm 沙箱 + fake DOM + fake speechSynthesis：点朗读 → 逐句 `onend`
 → 高亮推进 → 全队列完成（含 `aria-valuenow` 同步）；停止 → `cancel` 且不再 `speak`；无 `speechSynthesis` 时按钮禁用 + 提示；
@@ -411,7 +435,7 @@ python smoke_widget.py <standalone.html>
   点击「朗读」时也会再探测一次。
 - **`speak()` 抛异常的环境**（无音频设备等）：片段会降级提示并收起控件，不会卡在「朗读中」；
   此时用 CLI 的 `sapi` 引擎（`SetOutputToWaveFile` 不依赖播放设备）兜底。
-- **`--wav` 中断语义**：见上节，只有干净结束的块会进合并结果。
+- **`--wav` 中断语义**：见上节，中断即整次作废（不产出目标 wav、回收本次分块），退出码 130。
 - **`node:sqlite` 在 Node 22 仍是实验特性**，加载时打 `ExperimentalWarning`；CLI 与单测都只针对
   SQLite 这条静音，其余警告照旧。
 - 片段按宿主 visualize 渲染约束设计（沙箱 iframe、无网络、主题变量）；移植到其它宿主时需自行确认对应约束。

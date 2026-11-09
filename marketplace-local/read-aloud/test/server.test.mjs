@@ -186,6 +186,9 @@ function createPythonEdgeStub() {
     "control = os.environ.get('RA_TEST_STUB_CONTROL')",
     "mode = None",
     "sleep_s = float(os.environ.get('RA_TEST_STUB_SLEEP', '0'))",
+    "# RA_TEST_STUB_TAG：healthy 产物按 tag 变内容（长度不变），并发写同一 key 时可断言",
+    "# 「最终文件 = 两者之一的完整内容」而非 merely 大小合法（并发回归用）。",
+    "tag = os.environ.get('RA_TEST_STUB_TAG') or 'x'",
     "if control and os.path.exists(control):",
     "    with open(control, encoding='utf-8') as fh:",
     "        lines = [ln.strip() for ln in fh.read().splitlines()]",
@@ -212,7 +215,7 @@ function createPythonEdgeStub() {
     "    time.sleep(sleep_s)",
     "if media:",
     "    with open(media, 'wb') as fh:",
-    "        fh.write(bytes([73, 68, 51, 3, 0, 0, 0, 0, 0, 0]) + bytes([255, 251]) + bytes(2048))",
+    "        fh.write(bytes([73, 68, 51, 3, 0, 0, 0, 0]) + (tag.encode('utf-8') * 1000) + bytes(64))",
     "if marker:",
     "    with open(marker, 'a', encoding='utf-8') as fh:",
     "        fh.write('done' + chr(10))",
@@ -1318,5 +1321,207 @@ test("SAPI 兜底：edge 与 SAPI 都失败时错误含两段原因", async () =
     assert.match(String(resp.error.message), /未找到 PowerShell 7/);
   } finally {
     client.close();
+  }
+});
+
+// ---------------------------------------------------------------- 原子写收尾回归（2026-11-09）
+// 缓存位落盘 = 「同目录唯一 .part 临时文件 → fsync → 原子 rename」。这里补齐两个 MCP 黑盒
+// 测不到的场景：① 有效缓存永远先命中、黑盒打不出「失败重写覆盖既有版本」，须直调
+// synthesizeEdge；② 同 key 去重（inflightSynth）只在单进程内生效，跨进程并发须双 server。
+
+import { synthesizeEdge, flushThenRename } from "../dist/server.mjs";
+
+function findPythonSync() {
+  const candidates = [];
+  if (process.env.RA_PYTHON_PATH) candidates.push(String(process.env.RA_PYTHON_PATH).trim());
+  candidates.push("python", "python3", "py");
+  for (const cand of candidates) {
+    const args = cand === "py" ? ["-3", "--version"] : ["--version"];
+    const r = spawnSync(cand, args, { encoding: "utf8", timeout: 10000 });
+    if (r.status === 0 && /Python\s/i.test(String(r.stdout || ""))) return cand;
+  }
+  return null;
+}
+
+// 与 createPythonEdgeStub 的 healthy 输出逐字节对齐：header 8 字节 + tag×1000 + 64 字节 = 1072
+function stubHealthyBytes(tag) {
+  return Buffer.concat([
+    Buffer.from([73, 68, 51, 3, 0, 0, 0, 0]),
+    Buffer.from(String(tag).repeat(1000), "utf8"),
+    Buffer.alloc(64),
+  ]);
+}
+
+async function withTestEnv(overrides, fn) {
+  const saved = {};
+  for (const k of Object.keys(overrides)) {
+    saved[k] = process.env[k];
+    process.env[k] = overrides[k];
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const k of Object.keys(overrides)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+async function waitUntil(fn, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fn()) return true;
+    await new Promise((r) => setTimeout(r, 40));
+  }
+  return fn();
+}
+
+function seedPreviousVersion(target) {
+  const previous = Buffer.concat([Buffer.from([73, 68, 51, 3]), Buffer.alloc(4096, 0x5a)]);
+  fs.writeFileSync(target, previous);
+  return previous;
+}
+
+test("原子写（直调）：rename 前合成失败，既有缓存版本完整保留且无 .part 残留", async (t) => {
+  const python = findPythonSync();
+  if (!python) return t.skip("python 不可用");
+  const { stubDir } = createPythonEdgeStub();
+  const cacheDir = path.join(TMP, "atomic-unit-fail");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const target = path.join(cacheDir, "seeded.mp3");
+  const previous = seedPreviousVersion(target);
+  const control = path.join(TMP, "stub-control-atomic-fail.txt");
+  fs.writeFileSync(control, "fail\n0\n", "utf8"); // 桩退出码 1、不产文件
+  await withTestEnv({
+    RA_PYTHON_PATH: python,
+    PYTHONPATH: stubDir,
+    RA_TEST_STUB_CONTROL: control,
+  }, async () => {
+    await assert.rejects(
+      () => synthesizeEdge("存量覆盖场景。", "zh-CN-XiaoxiaoNeural", "+0%", target),
+      /退出码 1/,
+      "fail 桩应让 synthesizeEdge 抛错"
+    );
+  });
+  assert.ok(fs.readFileSync(target).equals(previous), "目标缓存位必须保持上一次的完整版本");
+  const residue = fs.readdirSync(cacheDir).filter((f) => f.indexOf(".part") >= 0);
+  assert.deepEqual(residue, [], "不得残留 .part 临时文件: " + residue.join(", "));
+});
+
+test("原子写（直调）：超时 SIGKILL 留下的半截 .part 被清理，既有缓存版本完整保留", async (t) => {
+  const python = findPythonSync();
+  if (!python) return t.skip("python 不可用");
+  const { stubDir } = createPythonEdgeStub();
+  const cacheDir = path.join(TMP, "atomic-unit-partial");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const target = path.join(cacheDir, "seeded.mp3");
+  const previous = seedPreviousVersion(target);
+  const control = path.join(TMP, "stub-control-atomic-partial.txt");
+  fs.writeFileSync(control, "partial\n2.5\n", "utf8"); // 先写 13 字节半截再挂起
+  await withTestEnv({
+    RA_PYTHON_PATH: python,
+    PYTHONPATH: stubDir,
+    RA_TEST_STUB_CONTROL: control,
+    RA_SYNTH_TIMEOUT_MS: "600",
+  }, async () => {
+    await assert.rejects(
+      () => synthesizeEdge("半截中断场景。", "zh-CN-XiaoxiaoNeural", "+0%", target),
+      /超时/,
+      "挂起桩应触发超时中止"
+    );
+  });
+  const residueOk = await waitUntil(
+    () => fs.readdirSync(cacheDir).filter((f) => f.indexOf(".part") >= 0).length === 0
+  );
+  assert.ok(residueOk, "半截 .part 应被清理，实测: " + fs.readdirSync(cacheDir).join(", "));
+  assert.ok(fs.readFileSync(target).equals(previous), "半截中断后目标缓存位必须保持上一次的完整版本");
+});
+
+test("原子写（直调）：成功合成经 fsync + 原子 rename 完整替换既有缓存位", async (t) => {
+  const python = findPythonSync();
+  if (!python) return t.skip("python 不可用");
+  const { stubDir } = createPythonEdgeStub();
+  const cacheDir = path.join(TMP, "atomic-unit-success");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const target = path.join(cacheDir, "seeded.mp3");
+  seedPreviousVersion(target);
+  const control = path.join(TMP, "stub-control-atomic-success.txt");
+  fs.writeFileSync(control, "healthy\n0\n", "utf8");
+  await withTestEnv({
+    RA_PYTHON_PATH: python,
+    PYTHONPATH: stubDir,
+    RA_TEST_STUB_CONTROL: control,
+    RA_TEST_STUB_TAG: "U",
+  }, async () => {
+    await synthesizeEdge("成功替换场景。", "zh-CN-XiaoxiaoNeural", "+0%", target);
+  });
+  assert.ok(fs.readFileSync(target).equals(stubHealthyBytes("U")), "成功路径应原子替换为完整新内容");
+  const residue = fs.readdirSync(cacheDir).filter((f) => f.indexOf(".part") >= 0);
+  assert.deepEqual(residue, [], "成功路径同样不得残留 .part: " + residue.join(", "));
+});
+
+test("原子写（直调）：flushThenRename 把 .part 完整替换到已有旧版本的最终位", () => {
+  const dir = path.join(TMP, "atomic-flushrename");
+  fs.mkdirSync(dir, { recursive: true });
+  const finalFile = path.join(dir, "final.mp3");
+  const partFile = path.join(dir, "final.mp3." + process.pid + ".abc.part.mp3");
+  fs.writeFileSync(finalFile, Buffer.alloc(2048, 0x11));
+  const fresh = Buffer.concat([Buffer.from([73, 68, 51, 3]), Buffer.alloc(1072, 0x22)]);
+  fs.writeFileSync(partFile, fresh);
+  return flushThenRename(partFile, finalFile).then(() => {
+    assert.ok(fs.readFileSync(finalFile).equals(fresh), "最终位应被 .part 的完整内容原子替换");
+    assert.equal(fs.existsSync(partFile), false, "rename 后 .part 不应存在");
+  });
+});
+
+test("原子写（跨进程）：两个 server 并发写同一缓存 key，最终文件为两者之一的完整内容", async () => {
+  const dbPath = await createFixtureDb();
+  const { stubDir } = createPythonEdgeStub();
+  const cacheDir = path.join(TMP, "cache-race-crossproc");
+  const control = path.join(TMP, "stub-control-crossproc.txt");
+  fs.writeFileSync(control, "healthy\n0\n", "utf8");
+  const baseEnv = {
+    RA_DB_PATH: dbPath,
+    ZCODE_PLUGIN_DATA: cacheDir,
+    PYTHONPATH: stubDir,
+    RA_TEST_STUB_CONTROL: control,
+    RA_PS7_PATH: path.join(TMP, "no-such-pwsh.exe"), // 隔离：只允许 edge 命中 mp3 位，排除 SAPI 兜底搅局
+  };
+  const c1 = new McpClient(SERVER, Object.assign({}, baseEnv, { RA_TEST_STUB_TAG: "A" }));
+  const c2 = new McpClient(SERVER, Object.assign({}, baseEnv, { RA_TEST_STUB_TAG: "B" }));
+  try {
+    const sessions = await Promise.all([
+      c1.call("tools/call", { name: "speak_session", arguments: { sessionId: "sess_main" } }),
+      c2.call("tools/call", { name: "speak_session", arguments: { sessionId: "sess_main" } }),
+    ]);
+    const s1 = JSON.parse(sessions[0].result.content[0].text);
+    const s2 = JSON.parse(sessions[1].result.content[0].text);
+    // 同一 db 同一块文本 + 同默认音色/倍速 → 同一 cacheKey → 同一最终缓存位
+    const [r1, r2] = await Promise.all([
+      c1.call("tools/call", { name: "speak_chunk", arguments: { requestId: s1.requestId, index: 0 } }),
+      c2.call("tools/call", { name: "speak_chunk", arguments: { requestId: s2.requestId, index: 0 } }),
+    ]);
+    assert.ok(r1.result, "进程 A 应成功: " + JSON.stringify(r1.error || {}));
+    assert.ok(r2.result, "进程 B 应成功: " + JSON.stringify(r2.error || {}));
+    const p1 = JSON.parse(r1.result.content[0].text);
+    const p2 = JSON.parse(r2.result.content[0].text);
+    assert.equal(p1.engine, "edge", "A 应走 edge");
+    assert.equal(p2.engine, "edge", "B 应走 edge");
+
+    const files = listCacheFiles(cacheDir);
+    const mp3s = files.filter((f) => f.endsWith(".mp3"));
+    assert.equal(mp3s.length, 1, "同 key 应恰好落一个最终 mp3: " + files.join(", "));
+    const final = fs.readFileSync(path.join(cacheDir, "chunks", mp3s[0]));
+    const contentA = stubHealthyBytes("A");
+    const contentB = stubHealthyBytes("B");
+    const isA = final.equals(contentA);
+    const isB = final.equals(contentB);
+    assert.ok(isA || isB, "最终文件必须是 A/B 之一的完整内容，不得是半截或交错产物（实测 " + final.length + " 字节）");
+    const residue = files.filter((f) => f.indexOf(".part") >= 0);
+    assert.deepEqual(residue, [], "并发结束后不得残留 .part: " + residue.join(", "));
+  } finally {
+    c1.close();
+    c2.close();
   }
 });
