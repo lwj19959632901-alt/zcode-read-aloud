@@ -345,7 +345,9 @@ AI Agent 会话库里混着大量**非对话内容**：系统提示词、deferre
 
 风险须知：
 
-- **官方升级会整包替换 `app.asar`**，注入行随之消失、按钮不见 —— 升级后重跑 `install.ps1` 即可；
+- **官方升级会整包替换 `app.asar`**，注入行随之消失、按钮不见 —— 常驻 watcher v3 会自动自愈
+  （计划任务 `ZCode-ReadAloudWatcher`，登录时 + 每小时；任务丢了重跑 `host-patch/register-task.ps1`
+  复现），急用也可手动重跑 `install.ps1`；
 - 安装 / 卸载都要求**完全退出 ZCode**（含托盘/后台进程），工具检测到运行中会直接拒绝；
 - **仅适用于 Windows + ZCode 桌面端**；卸载只剥离注入行（strip-only），不会用旧备份覆盖 asar。
 

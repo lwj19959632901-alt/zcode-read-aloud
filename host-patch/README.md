@@ -22,8 +22,9 @@
 | `readaloud-loader.cjs` | **主进程**：解析 python → 起 127.0.0.1 临时端口 HTTP 桥（`/health` `/voices` `/tts` 流式）→ 只向 URL 含 `app.asar/out/renderer` 的窗口注入渲染脚本；失败只记日志 |
 | `readaloud-renderer.js` | **渲染层**：定位操作栏 → clone 复制按钮 → 喇叭图标 + `aria-label="朗读"` → 🔊 后插倍速按钮（循环 `1.0×/1.25×/1.5×/2.0×/0.75×`，存 localStorage）→ 点击取活节点 `innerText` → 按句切块流式 `<audio>` 播放 → 再点停止 → 不可用时降级 `speechSynthesis` → `MutationObserver` 兜底重注入 |
 | `patch-readaloud.py` | **asar 补丁器**：`selftest` / `install` / `remove` / `check` |
-| `readaloud-keys-watcher.py` | **watcher v3（常驻）**：等 ZCode 完全退出 → 等 Update.exe/elevate.exe 静默 → 清残留 install_monitor → 装 zusage 状态条 + 朗读键双补丁 → **仅 `app.asar` sha256 变化才重启**；`selftest` 子命令离线自检决策链；7 天超时退出，由计划任务重新武装 |
-| `arm-watcher.ps1` | 武装脚本（幂等）：`readaloud-keys-watcher.py` 已在跑则跳过，否则隐藏窗口启动它；计划任务 `ZCode-ReadAloudWatcher`（登录时 + 每小时）的入口 |
+| `readaloud-keys-watcher.py` | **watcher v3（常驻）**：等 ZCode 完全退出 → 等自动更新器静默（按 `ExecutablePath` 判定 electron-updater 产物，非 Squirrel） → 清残留 install_monitor → 装 zusage 状态条 + 朗读键双补丁 → **仅 `app.asar` sha256 变化才重启**（重启前复检客户端，避免双开）；`selftest` 子命令离线自检决策链；5s 轮询；7 天超时退出，由计划任务重新武装 |
+| `arm-watcher.ps1` | 武装脚本（幂等）：`readaloud-keys-watcher.py` 已在跑则跳过，否则隐藏窗口启动它；python 解释器分级探测（默认安装位 → `Get-Command python/python3` → 报错退出非 0）；计划任务 `ZCode-ReadAloudWatcher`（登录时 + 每小时）的入口 |
+| `register-task.ps1` | 计划任务注册脚本（幂等）：注册/更新 `ZCode-ReadAloudWatcher`（AtLogOn 当前用户 + 每小时重复；动作 = pwsh 全路径跑 `arm-watcher.ps1`；主体 = 当前用户 Interactive，不用 S4U/密码；`MultipleInstances=IgnoreNew`）。**任务丢了就重跑它** |
 | `install.ps1` / `uninstall.ps1` | PS7 runbook（全路径 `C:\Program Files\PowerShell\7\pwsh.exe`，自动用 PS7 重跑自己） |
 | `state/entry-pristine.json` | 安装前入口指纹（按 asar 路径记录；`remove` 时用来断言字节回到原样；可删） |
 
@@ -161,23 +162,66 @@ zusage 每 60 秒会自动重装自己的注入行，会把我们的行挤到**�
 
 ## 升级 ZCode 之后（自动自愈链）
 
-官方升级（Squirrel 整包替换 `app.asar`）会同时抹掉 zusage 状态条与朗读键两条注入行。
+官方升级（整包替换 `app.asar`）会同时抹掉 zusage 状态条与朗读键两条注入行。
 自愈由常驻 watcher v3 完成，一般**无需手动重跑 `install.ps1`**：
 
 ```
-计划任务 ZCode-ReadAloudWatcher（登录时 + 每小时）
+计划任务 ZCode-ReadAloudWatcher（登录时 + 每小时；任务丢了就重跑 register-task.ps1 复现）
   -> arm-watcher.ps1（幂等武装：watcher 已在跑则跳过）
-  -> readaloud-keys-watcher.py v3 常驻（tasklist 2s 轮询等 ZCode 完全退出）
-  -> 退出后：等 Update.exe/elevate.exe 静默 -> 清残留 install_monitor
-     -> 装 zusage 状态条 -> 装/校验朗读键 -> 对比 app.asar sha256
+  -> readaloud-keys-watcher.py v3 常驻（tasklist 5s 轮询等 ZCode 完全退出）
+  -> 退出后：等自动更新器静默（按可执行文件路径判定）-> 清残留 install_monitor
+     -> 装 zusage 状态条（带 ZUSAGE_MONITOR_QUIET=1，自愈时不弹黑窗）
+     -> 装/校验朗读键 -> 对比 app.asar sha256
   -> 仅当 sha 真的变化才重启 ZCode（无变更不打扰）；7 天超时退出，由任务重新武装
 ```
+
+### 静默期怎么判「更新器在跑」（按路径，不按进程名）
+
+ZCode 3.18.0 的 `resources/app-update.yml` 是 `provider: generic` —— 走 **electron-updater**，
+不是 Squirrel。更新器产物在 `%LOCALAPPDATA%\@zcodedesktop-updater\`（`installer.exe` 237MB、
+`pending\ZCode-3.18.0-win-x64.exe`），所以 watcher 改用 `Get-CimInstance Win32_Process`
+按 **ExecutablePath** 判定：
+
+- 可执行路径在 `%LOCALAPPDATA%\@zcodedesktop-updater\` 下 -> 判为更新器在跑
+  （目录名取自 `D:\ZCode\resources\app-update.yml` 的 `updaterCacheDirName: "@zcodedesktop-updater"`，
+  读不到就用内置默认名，宿主改 appId 也不会失效）；
+- 可执行路径在 ZCode 安装目录（由 asar 路径反推）且进程名属于
+  `{Update.exe, elevate.exe, installer.exe, ZCode-*-win-x64.exe}` -> 判为更新器在跑；
+- 其余进程一律不管：旧的 `tasklist` 全表子串匹配 `"update.exe"` **既盯不到真更新器**
+  （真更新器叫 `installer.exe`），**又会被 `GoogleUpdate.exe` / `DropboxUpdate.exe` 之类误命中**，
+  白白中止 180s；
+- 查不到 / 出错 -> 保守按「更新器在跑」处理（宁可不装，也不与安装器并发改 `app.asar`）。
+
+### 轮询 5s
+
+`tasklist` 全量查询实测 1.6-2.5s，2s 名义周期实际约 4s，日均约 2.16 万次进程表枚举 —— 改成 5s。
+
+### 双开防护
+
+重启前会**再查一次客户端**：从杀 ZCode 到重启之间的窗口里，用户若自己拉起了客户端，
+watcher 只记日志「客户端已自行启动，不重复重启」，不再拉第二个窗口。
+（跨进程独占锁是另一道防线：第二个 watcher 实例立刻退出。）
+
+### 陈旧大文件只记录不删
+
+每轮开始会记录 `D:\ZCode\resources\` 下 `app.asar.zusage.tmp`、`app.asar.orig`、
+`app.asar.readaloud-stage` 的存在与大小（各 300-400MB 级），**watcher 一律不删**：
+`app.asar.orig` 是插件的回滚备份（比现役 asar 旧一个月），既不能删，也**绝不可当恢复源**
+（见上文「三条硬规则」第 2 条）。删不删由人决定，watcher 只报账。
+
+### 安装失败不许往下走
+
+`patch-readaloud.py install` 的退出码只有 0（装好）和 2（客户端又在跑）能继续；
+其它退出码（装完校验失败、权限、磁盘……）一律**中止本轮**：不跑 check、不动 asar、不重启 ——
+此时 asar 可能处于半截状态，重启等于把坏包送给用户。
 
 设计行为：**开机/武装时若 ZCode 本来就没在跑**，v3 会直接装补丁，sha 有变化就顺手拉起 ZCode。
 
 手动兜底（计划任务丢失 / 想立即武装 / 想离线验证决策链）：
 
 ```powershell
+# 计划任务丢了/被系统清理 -> 重跑注册脚本复现（幂等，已存在则更新）：
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1
 # 武装（幂等，重复跑安全）：
 & 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -WindowStyle Hidden -File .\arm-watcher.ps1
 # 或直接前台跑 watcher / 离线自检决策链：

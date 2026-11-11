@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """readaloud + statusbar 双补丁 watcher（v3，常驻版）
 
-常驻等 ZCode 完全退出 -> 等 Update.exe / elevate.exe 静默（Squirrel 换包期间不动 asar）
+常驻等 ZCode 完全退出 -> 等自动更新器静默（换包期间不动 asar）
 -> 清残留 install_monitor（防 asar 竞态）-> 装 zusage 状态条补丁 -> 装 readaloud 消息栏
 按键补丁 -> check -> 对比 app.asar sha256：变化才重启 ZCode，无变化不重启；本轮结束后
 回等待下一次退出（7 天超时退出，由计划任务 ZCode-ReadAloudWatcher 重新武装）。
@@ -16,6 +16,17 @@
   3. 一次性、装完必重启 -> 常驻多轮自愈，且仅当 app.asar sha256 真的变化才重启
      （只在补丁实际落地后重启宿主是 2026-11-04 已验收的既定流程）。
 
+v3 后审修复（2026-11-11）：
+  - 更新器探测改为**按可执行文件路径判定**（P1-1）：ZCode 3.18.0 走 electron-updater
+    generic provider（app-update.yml: provider: generic），不是 Squirrel——更新器产物在
+    %LOCALAPPDATA%\\@zcodedesktop-updater\\（installer.exe、pending\\ZCode-*-win-x64.exe），
+    旧的 tasklist 全表子串匹配 "update.exe" 既盯不到真更新器，又会被 GoogleUpdate.exe /
+    DropboxUpdate.exe 误命中；
+  - 重启前复检客户端（P1-2）：杀 ZCode 到重启之间用户可能自己拉起客户端，此时不再重复拉起；
+  - install 退出码非 0/2 一律中止本轮（P2-7）：装完校验失败之类不许继续走 sha 对比与重启；
+  - 轮询 5s（P2-3）：tasklist 全量查询实测 1.6-2.5s，2s 名义周期实际约 4s，日均枚举 2.16 万次；
+  - 陈旧大文件只记录不删（P2-6）：app.asar.orig 是插件回滚备份，绝不当恢复源。
+
 用法：
   python readaloud-keys-watcher.py            # 常驻主循环
   python readaloud-keys-watcher.py selftest   # 离线决策链自检（不碰真实 asar、不杀真进程、不真重启）
@@ -24,6 +35,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,7 +51,13 @@ ASAR = Path(r"D:\ZCode\resources\app.asar")
 ZCODE_EXE = Path(r"D:\ZCode\ZCode.exe")
 PWSH = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")  # pwsh 一律全路径（禁短名/WindowsApps 桩）
 DEADLINE_DAYS = 7
-POLL_SECS = 2
+POLL_SECS = 5          # P2-3：tasklist 全量查询实测 1.6-2.5s，2s 名义周期实际约 4s，日均 2.16 万次枚举
+
+# P2-6：resources 下的陈旧大文件。每轮开始只记录存在与大小，**禁止删除**：
+#   - app.asar.zusage.tmp       ：zusage 状态条重打包中间产物（384MB）
+#   - app.asar.orig             ：插件回滚备份，比现役旧一个月 —— 绝不可当恢复源
+#   - app.asar.readaloud-stage  ：中断的 readaloud repack 残留（384MB）
+STALE_BIG_FILES = ("app.asar.zusage.tmp", "app.asar.orig", "app.asar.readaloud-stage")
 
 # 单实例独占锁文件。选 ~/.zcode/ 而不是脚本同目录（HERE）有三个理由：
 #   1) host-patch/ 是 git 仓库目录，丢一个 .lock 在那儿会让 `git status` 常驻一条
@@ -139,32 +157,122 @@ def zcode_alive() -> bool:
 
 
 def update_or_elevate_running() -> bool:
-    """Squirrel 更新器（Update.exe / elevate.exe，大小写不敏感）是否在跑；异常按在跑处理。"""
+    """ZCode 自动更新器是否在跑；**按可执行文件路径判定**（P1-1）。
+
+    查不到 / 出错 / 解析不出标记 -> 一律按「在跑」处理（保守：宁可不装，也不与
+    安装器并发改 app.asar）。
+    """
+    script = build_updater_script()
+    env = dict(os.environ)
+    env["READALOUD_UPDATER_DIR_NAME"] = resolve_updater_cache_dir_name()
     try:
-        out = subprocess.run(["tasklist"], capture_output=True, text=True,
-                             timeout=30, encoding="gbk", errors="replace").stdout or ""
+        r = subprocess.run([str(PWSH), "-NoProfile", "-Command", script],
+                           capture_output=True, text=True, timeout=120,
+                           encoding="utf-8", errors="replace", env=env)
     except Exception:
         return True
-    low = out.lower()
-    return "update.exe" in low or "elevate.exe" in low
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode != 0:
+        return True
+    m = re.search(r"UPDATER=(\d)", out)
+    if m is None:
+        return True
+    return m.group(1) != "0"
+
+
+def resolve_updater_cache_dir_name() -> str:
+    """读 app-update.yml 的 updaterCacheDirName（electron-updater 缓存目录名）。
+
+    本机实测 D:\\ZCode\\resources\\app-update.yml：
+        provider: generic
+        updaterCacheDirName: "@zcodedesktop-updater"
+    electron-updater 的缓存目录 = %LOCALAPPDATA%\\<updaterCacheDirName>\\（里面是
+    installer.exe 与 pending\\<包名>.exe）。从配置文件读，宿主改 appId 也不会失效；
+    读不到就退回内置默认名。
+    """
+    default = "@zcodedesktop-updater"
+    try:
+        text = (ASAR.parent / "app-update.yml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return default
+    m = re.search(r"^\s*updaterCacheDirName:\s*[\"']?([^\"'\s#]+)", text, re.M)
+    if m and m.group(1):
+        return m.group(1)
+    return default
+
+
+def build_updater_script() -> str:
+    """构造「更新器是否在跑」的 pwsh 脚本文本（selftest 断言按路径判定）。
+
+    口径（P1-1：ZCode 3.18.0 的 app-update.yml 是 provider: generic —— 走
+    electron-updater，**不是** Squirrel）：
+      - 进程可执行路径位于 %LOCALAPPDATA%\\<updaterCacheDirName>\\ 下 -> 更新器在跑
+        （installer.exe 与 pending\\ZCode-<版本>-win-x64.exe 都在这个目录里；
+         目录名由 app-update.yml 的 updaterCacheDirName 给出，经环境变量传给 pwsh，
+         读不到则用内置默认名 '@zcodedesktop' + '-updater'）；
+      - 进程可执行路径位于 ZCode 安装目录（由 asar 路径反推）且进程名属于
+        {Update.exe, elevate.exe, installer.exe, ZCode-*-win-x64.exe} -> 更新器在跑；
+      - 其余进程一律不管：**不再**做 tasklist 全表子串匹配（旧口径既盯不到真更新器，
+        又会被 GoogleUpdate.exe / DropboxUpdate.exe 之类误命中，白白中止 180s）。
+
+    匹配串在 pwsh 里运行时拼接（'Update' + '.exe' 等），本函数自己起的 pwsh 子进程
+    命令行里不出现完整字面量（防自命中）；且本进程的可执行路径既不在更新器目录、
+    也不在 ZCode 安装目录，双重保证不会把自己当成更新器。
+    输出：UPDATER=1 / UPDATER=0。
+    """
+    return "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        "$updName = $env:READALOUD_UPDATER_DIR_NAME",
+        "if (-not $updName) { $updName = '@zcodedesktop' + '-updater' }",
+        "$updDir = (Join-Path $env:LOCALAPPDATA $updName).TrimEnd('\\')",
+        "$instDir = (Split-Path -Parent (Split-Path -Parent '" + str(ASAR) + "')).TrimEnd('\\')",
+        "# 名字集合每项都要加括号：PowerShell 数组字面量里 ',' 的结合比 '+' 更紧，",
+        "# @('a' + 'b', 'c' + 'd') 会被拼成单个字符串 'ab cd'（实测 Count=1），-contains 永远 False",
+        "$names = @(('Update' + '.exe'), ('elevate' + '.exe'), ('install' + 'er.exe'))",
+        "$pat = 'ZCode-' + '*-win-x64.exe'",
+        "$hit = 0",
+        "foreach ($p in (Get-CimInstance Win32_Process -ErrorAction Stop)) {",
+        "    $name = $p.Name",
+        "    if (-not $name) { continue }",
+        "    $path = $p.ExecutablePath",
+        "    if (-not $path) {",
+        "        # 读不到路径（SYSTEM / 受保护进程）：只按进程名精确匹配兜底，宁可多等",
+        "        if ($names -contains $name -or $name -like $pat) { $hit++ }",
+        "        continue",
+        "    }",
+        "    $np = $path.TrimEnd('\\')",
+        "    if ($np.StartsWith($updDir + '\\', [System.StringComparison]::OrdinalIgnoreCase)) { $hit++; continue }",
+        "    if ($np.StartsWith($instDir + '\\', [System.StringComparison]::OrdinalIgnoreCase)) {",
+        "        if ($names -contains $name -or $name -like $pat) { $hit++ }",
+        "    }",
+        "}",
+        "if ($hit -gt 0) { 'UPDATER=1' } else { 'UPDATER=0' }",
+    ])
 
 
 def build_kill_script() -> str:
     """构造「清残留 monitor」的 pwsh 脚本文本（selftest 会断言防自杀不变量）。
 
+    匹配口径收窄为**脚本名** install_monitor.py（P2-1）：旧口径是裸子串 "install_monitor"
+    匹配整条命令行，任何命令行里提到这个词的无关 python 进程都会被强杀。现在按
+    「路径分隔符/空白 + install_monitor.py + 非单词字符」的脚本名 token 匹配，
+    只有真的在跑 zusage 那个 install_monitor.py 的进程才会被杀。
+
     匹配串必须在 pwsh 里运行时拼接（'install' + '_monitor'），保证 "install_monitor"
     字面量不出现在任何进程命令行里——否则本函数自己起的 pwsh 子进程命令行会命中
-    过滤器（自杀）。另加 Name=python.exe 过滤双保险。
+    过滤器（自杀）。另加 Name 过滤双保险（python.exe / pythonw.exe：zusage 的监控
+    既可能由 python.exe 拉起，也可能由 WMI 脱离式 pythonw.exe 拉起，两者都算）。
     输出一行：KILLED=<n>（已清净）或 LEFT=<n>（杀完复查仍有存活）。
     """
     return "\n".join([
         "$ErrorActionPreference = 'Stop'",
         "$m = 'install' + '_monitor'",
-        "$targets = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $m + '*') })",
+        r"$re = '(?:^|[\s\\/])' + $m + '\.py(?![A-Za-z0-9_])'",
+        "$targets = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('python.exe','pythonw.exe') -and $_.CommandLine -match $re })",
         "$killed = 0",
         "foreach ($t in $targets) { try { Stop-Process -Id $t.ProcessId -Force -ErrorAction Stop; $killed++ } catch { } }",
         "Start-Sleep -Milliseconds 400",
-        "$left = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like ('*' + $m + '*') })",
+        "$left = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('python.exe','pythonw.exe') -and $_.CommandLine -match $re })",
         "if ($left.Count -gt 0) { 'LEFT=' + $left.Count } else { 'KILLED=' + $killed }",
     ])
 
@@ -227,15 +335,20 @@ def resolve_overlay_install():
     return None
 
 
-def run(label: str, script, arg: str):
+def run(label: str, script, arg: str, env: dict | None = None):
     """跑安装器子命令，尾部 12 行进日志（沿用 v2 run_installer 的日志格式）。
 
-    返回退出码；启动/超时异常返回 None（调用方按非 2 处理，安装器输出已自证）。
+    env：额外注入的环境变量（覆盖式叠加在本进程环境之上，不传则继承）。
+    返回退出码；启动/超时异常返回 None（调用方按非 0/2 处理，安装器输出已自证）。
     """
     log(f"[{label}] 执行 {Path(script).name} {arg}")
+    child_env = None
+    if env:
+        child_env = dict(os.environ)
+        child_env.update(env)
     try:
         r = subprocess.run([str(PY), str(script), arg], capture_output=True, text=True,
-                           timeout=900, encoding="utf-8", errors="replace")
+                           timeout=900, encoding="utf-8", errors="replace", env=child_env)
     except Exception as e:
         log(f"[{label}] 启动异常：{e}")
         return None
@@ -262,15 +375,34 @@ def restart_zcode() -> bool:
         return False
 
 
+def log_stale_big_files() -> None:
+    """P2-6：每轮开始只**记录** resources 下陈旧大文件的存在与大小（禁止删除）。
+
+    app.asar.orig 是插件的回滚备份（比现役旧一个月），既不能删也不能当恢复源；
+    app.asar.zusage.tmp / app.asar.readaloud-stage 是中断的 repack 残留，同理只记录。
+    """
+    d = ASAR.parent
+    for name in STALE_BIG_FILES:
+        p = d / name
+        try:
+            if p.is_file():
+                mb = p.stat().st_size / (1024 * 1024)
+                log(f"陈旧大文件（只记录不删）：{p} {mb:.1f} MB")
+        except OSError as e:
+            log(f"陈旧大文件探查失败（忽略）：{p} {e}")
+
+
 def one_round() -> str:
     """ZCode 已完全退出后的一轮装补丁决策。返回动作标签（selftest 逐个断言）。"""
-    # Update.exe 静默期：Squirrel 正在换包时不动 asar（等它结束或 ZCode 复活）
+    # P2-6：每轮开头记录陈旧大文件（只记录，不删）
+    log_stale_big_files()
+    # 自动更新器静默期：更新器正在换包时不动 asar（等它结束或 ZCode 复活）
     waited = 0
     while update_or_elevate_running() and waited < 180:
         time.sleep(POLL_SECS)
         waited += POLL_SECS
     if update_or_elevate_running():
-        log(f"更新器（Update/elevate）静默期 {waited}s 后仍在跑，本轮中止")
+        log(f"更新器（按路径判定）静默期 {waited}s 后仍在跑，本轮中止")
         return "abort-updater"
     if zcode_alive():
         log("更新器静默期后 ZCode 已复活，本轮中止")
@@ -287,7 +419,12 @@ def one_round() -> str:
         log(f"装前读 asar 指纹失败，本轮中止（不动 asar）：{e}")
         return "abort-asar-read"
     if overlay is not None:
-        run("状态条", overlay, "install")          # 非零退出：记日志，继续装朗读键（v2 语义）
+        # P2-5：zusage 的 launch_monitor 在 Windows 走 CREATE_NEW_CONSOLE —— 自愈时会在
+        # 桌面弹一个黑窗。ZUSAGE_MONITOR_QUIET=1 是 zusage 自带的静默开关（已实测：
+        # patch_install.py:294 / overlay_install.py:994 都认它，走 WMI 脱离式 pythonw
+        # 或 CREATE_NO_WINDOW，无窗口）。只给状态条 install 这一步加，不影响别的步骤。
+        run("状态条", overlay, "install", env={"ZUSAGE_MONITOR_QUIET": "1"})
+        # 非零退出：记日志，继续装朗读键（v2 语义）
     else:
         log("跳过状态条（zusage 插件路径解析失败），继续装朗读键")
     r1 = run("朗读键", PATCH, "install")
@@ -295,6 +432,11 @@ def one_round() -> str:
         # exit 2 = 客户端又在跑（安装器自己的输出已自证），本轮结束回等待
         log("安装时客户端又在运行（exit 2），本轮结束")
         return "abort-client-running"
+    if r1 not in (0, 2):
+        # P2-7：非 0/2 = 安装本身失败（装完校验失败、权限、磁盘……）。这种状态绝不能
+        # 继续走 sha 对比与重启：asar 可能处于半截状态，重启等于把坏包送给用户。
+        log(f"安装未成功（exit={r1}），本轮中止（不重启、不动 asar）")
+        return "abort-install-failed"
     run("朗读键check", PATCH, "check")             # 非零只记日志：重启与否只看 sha 对比
     try:
         asar_after = sha256_file(ASAR)
@@ -302,6 +444,11 @@ def one_round() -> str:
         log(f"装后读 asar 指纹失败，不重启（留待下一轮）：{e}")
         return "abort-asar-read-after"
     if asar_after != asar_before:
+        # P1-2：重启前复检客户端 —— 从杀 ZCode 到这里的几十秒里用户可能自己拉起了
+        # 客户端，此时再拉一个就是双开窗口。
+        if zcode_alive():
+            log("客户端已自行启动，不重复重启")
+            return "skip-restart-client-alive"
         log(f"补丁已落地（asar sha {asar_before[:12]}… -> {asar_after[:12]}…），重启 ZCode")
         restart_zcode()
         return "restart"
@@ -341,7 +488,7 @@ def main() -> None:
             if not seen_alive:
                 time.sleep(POLL_SECS)
                 continue
-            log("ZCode 已完全退出（tasklist 2s 轮询捕获）")
+            log(f"ZCode 已完全退出（tasklist {POLL_SECS}s 轮询捕获）")
             try:
                 action = one_round()
             except Exception as e:                     # 常驻兜底：单轮异常不倒整个 watcher
@@ -374,6 +521,29 @@ def cmd_selftest() -> int:
         ok_("kill script 运行时拼接构造，不含 install_monitor 字面量（防自杀）")
     else:
         bad_("kill script 含 install_monitor 字面量或未用拼接构造")
+
+    # --- 1b) P2-1：kill 匹配收窄到脚本名 install_monitor.py（不再是裸子串全表匹配）
+    if (".py" in script and "'_monitor'" in script
+            and "'*' + $m + '*'" not in script and "-like ('*' + $m" not in script):
+        ok_("kill script 只匹配 install_monitor.py 脚本名（不再是裸子串全表匹配）")
+    else:
+        bad_("kill script 匹配未收窄到 install_monitor.py 脚本名")
+
+    # --- 1c) P1-1：更新器探测按可执行文件路径判定，无裸 'update.exe' 全表子串匹配
+    uscript = build_updater_script()
+    ulow = uscript.lower()
+    if ("executablepath" in ulow and "zcodedesktop" in ulow
+            and "update.exe" not in ulow and "elevate.exe" not in ulow):
+        ok_("更新器探测按 ExecutablePath 判定（zcodedesktop-updater 目录），无裸 update.exe 全表匹配")
+    else:
+        bad_("更新器探测脚本不符合按路径判定（缺 ExecutablePath / zcodedesktop，或仍含裸 update.exe 匹配）")
+
+    # --- 1d) 名字集合每项加括号：PowerShell 数组字面量里 ',' 比 '+' 结合更紧，
+    #     @('a' + 'b', 'c' + 'd') 会拼成单个字符串（实测 Count=1），-contains 永远 False
+    if "$names = @(('Update' + '.exe')" in uscript:
+        ok_("更新器名字集合每项加括号（防 PowerShell 数组字面量把三项拼成一串）")
+    else:
+        bad_("更新器名字集合未逐项加括号（PowerShell 会拼成单串，-contains 永远 False）")
 
     # --- 2) 动态解析 zusage 插件路径（读真实 installed_plugins.json）
     overlay = resolve_overlay_install()
@@ -416,8 +586,9 @@ def cmd_selftest() -> int:
         swap("update_or_elevate_running", lambda: True)
         swap("kill_install_monitors", lambda: True)
         run_calls = []
+        env_calls = []          # 记录每次 run() 传下去的 env（断言 P2-5 静默开关）
 
-        def run_rec(label, script, arg):
+        def run_rec(label, script, arg, env=None):
             run_calls.append((label, arg))
             return 0
         swap("run", run_rec)
@@ -430,7 +601,7 @@ def cmd_selftest() -> int:
             ok_("更新器不死等：静默期封顶后 abort-updater，不动 asar、不装、不重启")
         else:
             bad_(f"更新器场景异常：action={action} run={run_calls} restart={len(restarted)}")
-        if len(sleep_log) >= 90 and all(s == POLL_SECS for s in sleep_log):
+        if len(sleep_log) * POLL_SECS >= 180 and all(s == POLL_SECS for s in sleep_log):
             ok_(f"静默期按 {POLL_SECS}s 步进封顶 180s（{len(sleep_log)} 次等待）")
         else:
             bad_(f"静默期步进异常：{len(sleep_log)} 次等待 {sorted(set(sleep_log))}")
@@ -464,14 +635,16 @@ def cmd_selftest() -> int:
             bad_(f"no-change 场景异常：action={action} run={run_calls} restart={len(restarted)}")
 
         # 3d) sha 变了才重启（朗读键 install 落盘 = sha 变化）
-        def run_patch_applies(label, script, arg):
+        def run_patch_applies(label, script, arg, env=None):
             run_calls.append((label, arg))
+            env_calls.append((label, env))
             if label == "朗读键" and arg == "install":
                 stub_asar.write_bytes(b"stub-asar-payload-v1" + b"\n;import patched")
             return 0
         swap("run", run_patch_applies)
         run_calls.clear()
         restarted.clear()
+        env_calls.clear()
         fresh_asar()
         action = one_round()
         if action == "restart" and len(restarted) == 1:
@@ -479,8 +652,18 @@ def cmd_selftest() -> int:
         else:
             bad_(f"restart 场景异常：action={action} restart={len(restarted)}")
 
+        # 3d-2) P2-5：状态条 install 这一步带 ZUSAGE_MONITOR_QUIET=1（zusage 自带静默开关，
+        #       自愈时不弹黑窗）；别的步骤不带这个变量
+        bar_env = next((e for lb, e in env_calls if lb == "状态条"), None)
+        other_env = [e for lb, e in env_calls if lb != "状态条"]
+        if (bar_env and bar_env.get("ZUSAGE_MONITOR_QUIET") == "1"
+                and all(not e for e in other_env)):
+            ok_("状态条 install 带 ZUSAGE_MONITOR_QUIET=1（静默，不弹黑窗），其余步骤不带")
+        else:
+            bad_(f"状态条 env 异常：bar={bar_env} others={other_env}")
+
         # 3e) install exit 2（客户端又在跑）-> 本轮结束回等待：不跑 check、不动 asar、不重启
-        def run_exit2(label, script, arg):
+        def run_exit2(label, script, arg, env=None):
             run_calls.append((label, arg))
             return 2 if arg == "install" else 0
         swap("run", run_exit2)
@@ -495,7 +678,51 @@ def cmd_selftest() -> int:
         else:
             bad_(f"exit2 场景异常：action={action} run={run_calls} restart={len(restarted)}")
 
-        # 3f) 常驻回等待：装完一轮后 ZCode 未再跑不重复处理；再见 alive 后才处理下一次退出
+        # 3f) P1-2 重启前复检客户端：用户自己拉起了 ZCode -> 跳过重启（不双开窗口）
+        #     打桩：zcode_alive 第 1 次调用（轮次开头）返回 False，第 2 次（重启前）返回 True
+        alive_calls = []
+
+        def alive_alive_on_recheck():
+            alive_calls.append(1)
+            return len(alive_calls) >= 2
+        swap("zcode_alive", alive_alive_on_recheck)
+
+        def run_patch_applies2(label, script, arg, env=None):
+            run_calls.append((label, arg))
+            if label == "朗读键" and arg == "install":
+                stub_asar.write_bytes(b"stub-asar-payload-v1" + b"\n;import patched")
+            return 0
+        swap("run", run_patch_applies2)
+        run_calls.clear()
+        restarted.clear()
+        alive_calls.clear()
+        fresh_asar()
+        action = one_round()
+        if (action == "skip-restart-client-alive" and not restarted
+                and len(alive_calls) >= 2):
+            ok_("重启前复检客户端：用户已自行启动 -> 跳过重启，不重复拉起（非 abort）")
+        else:
+            bad_(f"重启前复检异常：action={action} restart={len(restarted)} alive_calls={len(alive_calls)}")
+
+        # 3g) P2-7 install 退出码 1（非 0/2，装完校验失败等）-> 本轮中止：不跑 check、
+        #     不动 asar、不重启
+        def run_exit1(label, script, arg, env=None):
+            run_calls.append((label, arg))
+            return 1 if arg == "install" else 0
+        swap("run", run_exit1)
+        swap("zcode_alive", lambda: False)
+        run_calls.clear()
+        restarted.clear()
+        sha0 = fresh_asar()
+        action = one_round()
+        if (action == "abort-install-failed" and not restarted
+                and sha256_file(stub_asar) == sha0
+                and not any(arg == "check" for _, arg in run_calls)):
+            ok_("install exit 1：abort-install-failed，不跑 check、不动 asar、不重启")
+        else:
+            bad_(f"exit1 场景异常：action={action} run={run_calls} restart={len(restarted)}")
+
+        # 3h) 常驻回等待：装完一轮后 ZCode 未再跑不重复处理；再见 alive 后才处理下一次退出
         round_log = []
         swap("one_round", lambda: round_log.append(datetime.now()) or "no-change")
         alive_seq = iter([False, False, True, False, False])
@@ -508,7 +735,7 @@ def cmd_selftest() -> int:
         swap("zcode_alive", fake_alive)
         swap("update_or_elevate_running", lambda: False)
         swap("kill_install_monitors", lambda: True)
-        swap("run", lambda label, script, arg: 0)
+        swap("run", lambda label, script, arg, env=None: 0)
         try:
             main()
         except _SeqDone:
