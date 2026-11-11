@@ -505,13 +505,40 @@ def run(label: str, script, arg: str, env: dict | None = None):
 
 
 def restart_zcode() -> bool:
-    """重启 ZCode（仅在补丁实际落地、asar sha 变化后调用）。"""
+    """重启 ZCode（仅在补丁实际落地、asar sha 变化后调用）。
+
+    D:\\ZCode\\ZCode.exe 的清单要求管理员权限；watcher 由计划任务
+    ZCode-ReadAloudWatcher 以 Interactive/Limited 启动时，Popen 直接抛
+    WinError 740（请求的操作需要提升，2026-11-11 17:27:42 实测）。
+    这条路径改走 ShellExecuteW 的 "runas" 动词：弹一次 UAC，用户点「是」
+    后 ZCode 以管理员身份启动。UAC 被取消（返回 <= 32）或 ctypes 抛错时
+    只记日志并返回 False，绝不把异常抛给常驻主循环。
+    """
     try:
         subprocess.Popen([str(ZCODE_EXE)], close_fds=True)
         return True
+    except OSError as e:
+        # 真实 Popen 的形态是 winerror=740/errno=22（PyErr_SetFromWindowsErr），
+        # 而 OSError(740, ...) 构造出来是 errno=740/winerror=None；两种都认。
+        winerr = getattr(e, "winerror", None)
+        if winerr != 740 and getattr(e, "errno", None) != 740:
+            log(f"重启 ZCode 失败：{e}")
+            return False
     except Exception as e:
         log(f"重启 ZCode 失败：{e}")
         return False
+    try:
+        import ctypes
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", str(ZCODE_EXE), None, None, 1)
+    except Exception as e:            # 用户取消 UAC / ctypes 加载失败等一律吞掉
+        log(f"UAC 提权启动失败：{e}")
+        return False
+    if rc > 32:                       # ShellExecute 成功返回值 > 32
+        log("已通过 UAC 提权请求启动 ZCode（需用户确认）")
+        return True
+    log(f"UAC 提权启动失败 rc={rc}")
+    return False
 
 
 def log_stale_big_files() -> None:
@@ -758,6 +785,8 @@ def cmd_selftest() -> int:
         pass
 
     try:
+        # 3a 起 restart_zcode 会被 swap 成打桩函数；3j 要测真实实现，先留一份引用
+        real_restart_zcode = restart_zcode
         swap("LOG", stub_log)
         swap("ASAR", stub_asar)
         # 单实例锁也换成临时文件：selftest 内部会调 main()，不能跟真 watcher 抢锁
@@ -953,6 +982,42 @@ def cmd_selftest() -> int:
             ok_("常驻回等待：一轮后 ZCode 未再跑不重复处理，再见 alive 后才处理下一次退出（共 2 轮）")
         else:
             bad_(f"主循环轮次异常：{len(round_log)} 轮（期望 2）")
+
+        # 3j) WinError 740 兜底：D:\ZCode\ZCode.exe 清单要求提升，Popen 起不来时改走
+        #     ShellExecute "runas"（弹 UAC）。真机异常形态是 winerror=740/errno=22，
+        #     这里按 OSError(740, ...) 复现（该构造 winerror=None、errno=740，两种都要认）。
+        import ctypes
+        orig_popen = subprocess.Popen
+        shell32 = ctypes.windll.shell32
+        orig_se = shell32.ShellExecuteW
+        runas_calls = []
+
+        def popen_740(*a, **kw):
+            raise OSError(740, "需要提升")
+
+        def se_ok(hwnd, verb, path, args, cwd, show):
+            runas_calls.append((verb, path, show))
+            return 33
+
+        def se_cancel(hwnd, verb, path, args, cwd, show):
+            runas_calls.append((verb, path, show))
+            return 5
+        try:
+            subprocess.Popen = popen_740
+            shell32.ShellExecuteW = se_ok
+            r_uac = real_restart_zcode()
+            shell32.ShellExecuteW = se_cancel
+            r_cancel = real_restart_zcode()
+        finally:
+            subprocess.Popen = orig_popen
+            shell32.ShellExecuteW = orig_se
+        if (r_uac is True and r_cancel is False
+                and runas_calls and runas_calls[0][0] == "runas"
+                and runas_calls[0][1].endswith("ZCode.exe")):
+            ok_("WinError 740 兜底：Popen 提升失败改走 ShellExecute runas（返回 33 -> True）；"
+                "UAC 取消（返回 5）-> False 且不抛")
+        else:
+            bad_(f"740 兜底异常：r_uac={r_uac} r_cancel={r_cancel} calls={runas_calls!r}")
     finally:
         time.sleep = orig_sleep
         for name, value in saved.items():
