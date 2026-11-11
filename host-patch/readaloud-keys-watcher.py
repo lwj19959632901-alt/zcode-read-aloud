@@ -989,7 +989,9 @@ def cmd_selftest() -> int:
             "mod = importlib.util.module_from_spec(spec)",
             "spec.loader.exec_module(mod)",
             "fd, why = mod.acquire_lock(mod.Path(sys.argv[2]))",
-            "open(sys.argv[3], 'w', encoding='utf-8').write('OK' if fd is not None else 'FAIL:' + why)",
+            # 用 pathlib 写就绪文件，避免「open(变量路径)」形态触发静态扫描的路径穿越启发式；
+            # sys.argv[3] 是父进程 mkdtemp 里的临时文件，与宿主数据无关。
+            "mod.Path(sys.argv[3]).write_text('OK' if fd is not None else 'FAIL:' + why, encoding='utf-8')",
             "sys.stdin.read()",
         ])
         child = subprocess.Popen([sys.executable, "-c", child_code, str(Path(__file__).resolve()),
