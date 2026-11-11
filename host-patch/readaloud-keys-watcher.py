@@ -27,6 +27,20 @@ v3 后审修复（2026-11-11）：
   - 轮询 5s（P2-3）：tasklist 全量查询实测 1.6-2.5s，2s 名义周期实际约 4s，日均枚举 2.16 万次；
   - 陈旧大文件只记录不删（P2-6）：app.asar.orig 是插件回滚备份，绝不当恢复源。
 
+v3 复审 P2 修复（2026-11-11）：
+  - null-path 不再按进程名兜底（P2-2）：ExecutablePath 读不到（SYSTEM/受保护进程，本机约 24 个）
+    的进程**一律不视为更新器**，只计数上报。旧口径在 null-path 分支按进程名匹配，而名单里
+    有 installer.exe 这种通用名 —— 机器上只要有一个 SYSTEM 级同名进程，每轮都判「更新器
+    在跑」，自愈永久静默失效且只留一行日志；
+  - Squirrel provider 兼容（P2-3）：同时读 app-update.yml 的 provider 字段；provider 含
+    squirrel 时额外认 %LOCALAPPDATA% 下的 Squirrel 产物（历史布局
+    %LOCALAPPDATA%\\<appId>\\app-<ver>\\Update.exe，既不在缓存目录也不在安装目录）；
+  - 连续轮次告警（P2-4）：fail-closed（查不到/出错按「在跑」）的失败模式是永久静默 ——
+    连续 N 轮判定「在跑」就追加一条写明两种可能的告警，某轮判「不在跑」即清零；
+  - ExecutionTimeLimit 因果注释修正（P2-1）：register-task.ps1 里「每小时任务会砍掉 watcher」
+    的说法不成立（arm 脚本 Start-Process 无 -Wait，任务本体只活约 1 秒，从不拥有 watcher
+    进程），改成防御性表述。
+
 用法：
   python readaloud-keys-watcher.py            # 常驻主循环
   python readaloud-keys-watcher.py selftest   # 离线决策链自检（不碰真实 asar、不杀真进程、不真重启）
@@ -52,6 +66,15 @@ ZCODE_EXE = Path(r"D:\ZCode\ZCode.exe")
 PWSH = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")  # pwsh 一律全路径（禁短名/WindowsApps 桩）
 DEADLINE_DAYS = 7
 POLL_SECS = 5          # P2-3：tasklist 全量查询实测 1.6-2.5s，2s 名义周期实际约 4s，日均 2.16 万次枚举
+
+# P2-4：更新器探测 fail-closed（查不到/出错一律按「在跑」）的失败模式是**永久静默** ——
+# 若探测持续异常（探测过宽 / CIM 挂了），自愈会无声地一直不生效，而每轮只留一行日志。
+# 故记「连续判定为在跑」的轮数：达到阈值就追加一条写明两种可能的告警；
+# 某轮判定为「不在跑」即清零（UPDATER_ALERT_REPEAT 只控制超过阈值后多久再报一次，避免刷屏）。
+UPDATER_ALERT_AFTER = 3       # 连续判定「在跑」达到该轮数即告警
+UPDATER_ALERT_REPEAT = 12     # 超过阈值后每多少轮再报一次（3、12、24、36…）
+UPDATER_RUNNING_STREAK = 0    # 连续判定为「更新器在跑」的轮数（0 = 上一轮不在跑）
+_UPDATER_NOPATH_LAST = -1     # 上次上报的 null-path 进程数（变化时才记日志）
 
 # P2-6：resources 下的陈旧大文件。每轮开始只记录存在与大小，**禁止删除**：
 #   - app.asar.zusage.tmp       ：zusage 状态条重打包中间产物（384MB）
@@ -160,27 +183,94 @@ def update_or_elevate_running() -> bool:
     """ZCode 自动更新器是否在跑；**按可执行文件路径判定**（P1-1）。
 
     查不到 / 出错 / 解析不出标记 -> 一律按「在跑」处理（保守：宁可不装，也不与
-    安装器并发改 app.asar）。
+    安装器并发改 app.asar）。这种 fail-closed 若**持续**发生就等于自愈静默失效，
+    故连续多轮判定「在跑」会追加一条明确告警（P2-4，见 record_updater_verdict）。
+    """
+    running, reason = probe_updater()
+    record_updater_verdict(running, reason)
+    return running
+
+
+def probe_updater() -> tuple[bool, str]:
+    """真正去探一次更新器，返回 (running, reason)。
+
+    running=True 有两种来源，reason 里写明：
+      - 命中更新器路径规则（真更新器在跑）；
+      - 探测本身失败（pwsh 起不来 / 退出码非 0 / 输出无法解析）—— fail-closed 保守
+        按「在跑」处理，但 reason 会标明，让 P2-4 的连续告警能看出是哪一种。
     """
     script = build_updater_script()
     env = dict(os.environ)
     env["READALOUD_UPDATER_DIR_NAME"] = resolve_updater_cache_dir_name()
+    env["READALOUD_UPDATER_PROVIDER"] = resolve_updater_provider()
     try:
         r = subprocess.run([str(PWSH), "-NoProfile", "-Command", script],
                            capture_output=True, text=True, timeout=120,
                            encoding="utf-8", errors="replace", env=env)
-    except Exception:
-        return True
+    except Exception as e:
+        return True, f"pwsh 调用异常（fail-closed）：{e}"
     out = ((r.stdout or "") + (r.stderr or "")).strip()
+    # null-path 计数（读不到 ExecutablePath 的进程数）：只上报，不参与判定（P2-2）
+    m_np = re.search(r"NOPATH=(\d+)", out)
+    if m_np:
+        note_nullpath_count(int(m_np.group(1)))
     if r.returncode != 0:
-        return True
+        return True, f"pwsh 退出码 {r.returncode}（fail-closed）"
     m = re.search(r"UPDATER=(\d)", out)
     if m is None:
-        return True
-    return m.group(1) != "0"
+        return True, "pwsh 输出无法解析（fail-closed）"
+    if m.group(1) != "0":
+        return True, "命中更新器路径规则"
+    return False, "未命中更新器路径规则"
 
 
-def resolve_updater_cache_dir_name() -> str:
+def record_updater_verdict(running: bool, reason: str = "") -> int:
+    """记录一轮「更新器是否在跑」的判定；连续在跑达阈值就打一条明确告警。
+
+    P2-4：fail-closed（查不到/出错一律按「在跑」）的失败模式是**永久静默** ——
+    探测若持续异常（探测过宽、CIM 挂了），自愈会无声地一直不生效，而每轮只留一行日志。
+    这里把连续「在跑」的轮数记下来，达到阈值就追加一条**写明两种可能**的告警：
+      - 更新器真的在跑（等它换完包即可）；
+      - 探测过宽 / CIM 异常（机器上有个通用名的进程就会这样）导致自愈被静默卡死。
+    判定为「不在跑」时计数清零。返回当前连续轮数。
+    """
+    global UPDATER_RUNNING_STREAK
+    if not running:
+        if UPDATER_RUNNING_STREAK:
+            log(f"更新器探测恢复为「不在跑」，连续在跑计数清零（此前 {UPDATER_RUNNING_STREAK} 轮）")
+        UPDATER_RUNNING_STREAK = 0
+        return 0
+    UPDATER_RUNNING_STREAK += 1
+    n = UPDATER_RUNNING_STREAK
+    if n == UPDATER_ALERT_AFTER or (n > UPDATER_ALERT_AFTER and n % UPDATER_ALERT_REPEAT == 0):
+        log(f"更新器探测连续 {n} 轮判定为在跑：可能是更新器真的在跑，"
+            f"也可能是探测过宽/CIM 异常导致自愈静默，请检查"
+            f"（本轮判定依据：{reason or '未记录'}）")
+    return n
+
+
+def updater_streak_reset() -> None:
+    """把「连续在跑」计数清零（selftest 用；正常运行靠「不在跑」自动清零）。"""
+    global UPDATER_RUNNING_STREAK
+    UPDATER_RUNNING_STREAK = 0
+
+
+def note_nullpath_count(n: int) -> None:
+    """null-path 进程数上报（P2-2）：读不到 ExecutablePath 的进程数变化时记一行。
+
+    这类进程（SYSTEM / 受保护进程，本机约 24 个）**一律不视为更新器**，也不按进程名
+    兜底；这里只把数量报出来，便于事后判断「探测口径是不是太宽」。
+    """
+    global _UPDATER_NOPATH_LAST
+    if n == _UPDATER_NOPATH_LAST:
+        return
+    _UPDATER_NOPATH_LAST = n
+    if n > 0:
+        log(f"更新器探测：{n} 个进程读不到 ExecutablePath（SYSTEM/受保护进程），"
+            f"按「不视为更新器」处理（null-path 不按进程名匹配）")
+
+
+def resolve_updater_cache_dir_name(yml_text: str | None = None) -> str:
     """读 app-update.yml 的 updaterCacheDirName（electron-updater 缓存目录名）。
 
     本机实测 D:\\ZCode\\resources\\app-update.yml：
@@ -189,13 +279,40 @@ def resolve_updater_cache_dir_name() -> str:
     electron-updater 的缓存目录 = %LOCALAPPDATA%\\<updaterCacheDirName>\\（里面是
     installer.exe 与 pending\\<包名>.exe）。从配置文件读，宿主改 appId 也不会失效；
     读不到就退回内置默认名。
+
+    yml_text：仅供 selftest 注入样本（None 时读真实文件）。
     """
     default = "@zcodedesktop-updater"
-    try:
-        text = (ASAR.parent / "app-update.yml").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return default
+    text = yml_text
+    if text is None:
+        try:
+            text = (ASAR.parent / "app-update.yml").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return default
     m = re.search(r"^\s*updaterCacheDirName:\s*[\"']?([^\"'\s#]+)", text, re.M)
+    if m and m.group(1):
+        return m.group(1)
+    return default
+
+
+def resolve_updater_provider(yml_text: str | None = None) -> str:
+    """读 app-update.yml 的 provider 字段（generic / squirrel / ...）。
+
+    本机实测 D:\\ZCode\\resources\\app-update.yml 是 provider: generic（electron-updater）。
+    P2-3：历史 Squirrel 布局（provider: squirrel）的更新器产物在
+    %LOCALAPPDATA%\\<appId>\\app-<ver>\\Update.exe —— 既不在 updaterCacheDirName 缓存目录、
+    也不在 ZCode 安装目录，只靠路径规则会漏判，故 provider 也要读。
+
+    yml_text：仅供 selftest 注入样本（None 时读真实文件）。
+    """
+    default = "generic"
+    text = yml_text
+    if text is None:
+        try:
+            text = (ASAR.parent / "app-update.yml").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return default
+    m = re.search(r"^\s*provider:\s*[\"']?([^\"'\s#]+)", text, re.M)
     if m and m.group(1):
         return m.group(1)
     return default
@@ -204,48 +321,70 @@ def resolve_updater_cache_dir_name() -> str:
 def build_updater_script() -> str:
     """构造「更新器是否在跑」的 pwsh 脚本文本（selftest 断言按路径判定）。
 
-    口径（P1-1：ZCode 3.18.0 的 app-update.yml 是 provider: generic —— 走
-    electron-updater，**不是** Squirrel）：
+    口径（P1-1 按路径 + P2-2 null-path 不按名 + P2-3 squirrel provider）：
       - 进程可执行路径位于 %LOCALAPPDATA%\\<updaterCacheDirName>\\ 下 -> 更新器在跑
         （installer.exe 与 pending\\ZCode-<版本>-win-x64.exe 都在这个目录里；
          目录名由 app-update.yml 的 updaterCacheDirName 给出，经环境变量传给 pwsh，
          读不到则用内置默认名 '@zcodedesktop' + '-updater'）；
       - 进程可执行路径位于 ZCode 安装目录（由 asar 路径反推）且进程名属于
         {Update.exe, elevate.exe, installer.exe, ZCode-*-win-x64.exe} -> 更新器在跑；
+      - provider 含 squirrel 时（P2-3，经环境变量 READALOUD_UPDATER_PROVIDER 传入）：
+        可执行路径位于 %LOCALAPPDATA% 下且进程名属于 {Update.exe, elevate.exe} ->
+        更新器在跑（Squirrel 布局 %LOCALAPPDATA%\\<appId>\\app-<ver>\\Update.exe 既不在
+        缓存目录也不在安装目录）；非 squirrel provider 下这条规则不生效；
+      - **ExecutablePath 读不到（SYSTEM / 受保护进程）一律不视为更新器**（P2-2）：
+        旧口径在这里按进程名兜底，而名单里有 installer.exe 这种通用名 —— 机器上只要
+        有一个 SYSTEM 级同名进程，每轮都判「更新器在跑」，自愈永久静默失效且只留一行
+        日志。真实更新器进程位于用户可读的更新器缓存目录，路径本就读得到；这类进程
+        只计数上报（输出 NOPATH=<n>），不参与判定；
       - 其余进程一律不管：**不再**做 tasklist 全表子串匹配（旧口径既盯不到真更新器，
         又会被 GoogleUpdate.exe / DropboxUpdate.exe 之类误命中，白白中止 180s）。
 
     匹配串在 pwsh 里运行时拼接（'Update' + '.exe' 等），本函数自己起的 pwsh 子进程
     命令行里不出现完整字面量（防自命中）；且本进程的可执行路径既不在更新器目录、
     也不在 ZCode 安装目录，双重保证不会把自己当成更新器。
-    输出：UPDATER=1 / UPDATER=0。
+    输出：NOPATH=<n>（读不到路径的进程数，只上报）+ UPDATER=1 / UPDATER=0。
     """
     return "\n".join([
         "$ErrorActionPreference = 'Stop'",
         "$updName = $env:READALOUD_UPDATER_DIR_NAME",
         "if (-not $updName) { $updName = '@zcodedesktop' + '-updater' }",
         "$updDir = (Join-Path $env:LOCALAPPDATA $updName).TrimEnd('\\')",
+        "$localDir = $env:LOCALAPPDATA.TrimEnd('\\')",
         "$instDir = (Split-Path -Parent (Split-Path -Parent '" + str(ASAR) + "')).TrimEnd('\\')",
+        "$prov = $env:READALOUD_UPDATER_PROVIDER",
+        "if (-not $prov) { $prov = 'gen' + 'eric' }",
+        "$isSquirrel = $prov.ToLower().Contains('squir' + 'rel')",
         "# 名字集合每项都要加括号：PowerShell 数组字面量里 ',' 的结合比 '+' 更紧，",
         "# @('a' + 'b', 'c' + 'd') 会被拼成单个字符串 'ab cd'（实测 Count=1），-contains 永远 False",
         "$names = @(('Update' + '.exe'), ('elevate' + '.exe'), ('install' + 'er.exe'))",
+        "$sqNames = @(('Update' + '.exe'), ('elevate' + '.exe'))",
         "$pat = 'ZCode-' + '*-win-x64.exe'",
         "$hit = 0",
+        "$nopath = 0",
         "foreach ($p in (Get-CimInstance Win32_Process -ErrorAction Stop)) {",
         "    $name = $p.Name",
         "    if (-not $name) { continue }",
         "    $path = $p.ExecutablePath",
         "    if (-not $path) {",
-        "        # 读不到路径（SYSTEM / 受保护进程）：只按进程名精确匹配兜底，宁可多等",
-        "        if ($names -contains $name -or $name -like $pat) { $hit++ }",
+        "        # NULLPATH-BEGIN：读不到 ExecutablePath（SYSTEM / 受保护进程）",
+        "        #   一律不视为更新器，也不按进程名兜底（通用名进程会永久把自愈卡死），",
+        "        #   只计数上报。",
+        "        $nopath++",
         "        continue",
+        "        # NULLPATH-END",
         "    }",
         "    $np = $path.TrimEnd('\\')",
         "    if ($np.StartsWith($updDir + '\\', [System.StringComparison]::OrdinalIgnoreCase)) { $hit++; continue }",
         "    if ($np.StartsWith($instDir + '\\', [System.StringComparison]::OrdinalIgnoreCase)) {",
         "        if ($names -contains $name -or $name -like $pat) { $hit++ }",
+        "        continue",
+        "    }",
+        "    if ($isSquirrel -and $np.StartsWith($localDir + '\\', [System.StringComparison]::OrdinalIgnoreCase)) {",
+        "        if ($sqNames -contains $name) { $hit++ }",
         "    }",
         "}",
+        "'NOPATH=' + $nopath",
         "if ($hit -gt 0) { 'UPDATER=1' } else { 'UPDATER=0' }",
     ])
 
@@ -402,7 +541,8 @@ def one_round() -> str:
         time.sleep(POLL_SECS)
         waited += POLL_SECS
     if update_or_elevate_running():
-        log(f"更新器（按路径判定）静默期 {waited}s 后仍在跑，本轮中止")
+        log(f"更新器（按路径判定）静默期 {waited}s 后仍在跑，本轮中止"
+            f"（连续判定在跑 {UPDATER_RUNNING_STREAK} 轮；见上方连续轮次告警）")
         return "abort-updater"
     if zcode_alive():
         log("更新器静默期后 ZCode 已复活，本轮中止")
@@ -545,6 +685,49 @@ def cmd_selftest() -> int:
     else:
         bad_("更新器名字集合未逐项加括号（PowerShell 会拼成单串，-contains 永远 False）")
 
+    # --- 1e) P2-2：null-path（ExecutablePath 读不到）分支**不按进程名匹配** ——
+    #     旧口径在这里按名字兜底，名单里的通用名（install + er.exe）会让机器上任意
+    #     一个同名 SYSTEM 进程永久把自愈卡死（只留一行日志）
+    npath_block = ""
+    if "NULLPATH-BEGIN" in uscript and "NULLPATH-END" in uscript:
+        npath_block = uscript.split("NULLPATH-BEGIN", 1)[1].split("NULLPATH-END", 1)[0]
+    if (npath_block and "$nopath++" in npath_block
+            and "-contains $name" not in npath_block
+            and "-like $pat" not in npath_block
+            and "$names" not in npath_block):
+        ok_("null-path 分支不做进程名匹配（只计数上报，不视为更新器）")
+    else:
+        bad_(f"null-path 分支仍按名字匹配：block={npath_block!r}")
+
+    # --- 1f) P2-2：脚本输出 null-path 计数，供日志上报
+    if "NOPATH=" in uscript and "$nopath = 0" in uscript:
+        ok_("更新器脚本输出 null-path 计数（NOPATH=<n>）供日志上报")
+    else:
+        bad_("更新器脚本未输出 null-path 计数")
+
+    # --- 1g) P2-3：读 app-update.yml 的 provider 字段（本机 generic；样本 squirrel）
+    prov_real = resolve_updater_provider()
+    prov_squ = resolve_updater_provider("provider: squirrel\nupdaterCacheDirName: \"x-updater\"\n")
+    prov_gen = resolve_updater_provider("provider: generic\n")
+    if prov_real == "generic" and prov_squ == "squirrel" and prov_gen == "generic":
+        ok_(f"app-update.yml provider 读取正确（本机={prov_real}，样本 squirrel={prov_squ}）")
+    else:
+        bad_(f"provider 读取异常：real={prov_real} squ={prov_squ} gen={prov_gen}")
+
+    # --- 1h) P2-3：provider 含 squirrel 时才启用 %LOCALAPPDATA% 下的 squirrel 规则
+    if ("READALOUD_UPDATER_PROVIDER" in uscript and "$isSquirrel" in uscript
+            and "$localDir" in uscript and "$sqNames" in uscript):
+        ok_("Squirrel 规则按 provider 字段启用（%LOCALAPPDATA% 下 + 专属进程名集合）")
+    else:
+        bad_("Squirrel provider 规则缺失（未读 provider 或无 %LOCALAPPDATA% 分支）")
+
+    # --- 1i) P2-3：squirrel 名字集合只含 Update/elevate 两个，不含通用名
+    sq_line = next((ln for ln in uscript.splitlines() if "$sqNames" in ln and "@(" in ln), "")
+    if sq_line and "install" not in sq_line:
+        ok_("Squirrel 名字集合只含 Update/elevate（不含通用名 installer）")
+    else:
+        bad_(f"Squirrel 名字集合异常：{sq_line!r}")
+
     # --- 2) 动态解析 zusage 插件路径（读真实 installed_plugins.json）
     overlay = resolve_overlay_install()
     if overlay is not None and "1.5.16" in str(overlay) and overlay.is_file():
@@ -580,6 +763,32 @@ def cmd_selftest() -> int:
         # 单实例锁也换成临时文件：selftest 内部会调 main()，不能跟真 watcher 抢锁
         # （真 watcher 持锁时 main() 会立刻返回，导致主循环断言误判）。
         swap("LOCK", tmpdir / "selftest-watch.lock")
+
+        # --- 3i) P2-4：连续 N 轮判定「更新器在跑」-> 追加一条写明两种可能的告警；
+        #     判定「不在跑」即清零（fail-closed 的永久静默不再无声）
+        streak_log = tmpdir / "streak.log"
+        swap("LOG", streak_log)
+        updater_streak_reset()
+        n1 = record_updater_verdict(True, "自测：命中更新器路径")
+        n2 = record_updater_verdict(True, "自测：命中更新器路径")
+        mid_log = streak_log.read_text(encoding="utf-8", errors="replace") if streak_log.exists() else ""
+        n3 = record_updater_verdict(True, "自测：命中更新器路径")
+        end_log = streak_log.read_text(encoding="utf-8", errors="replace") if streak_log.exists() else ""
+        if (n1 == 1 and n2 == 2 and n3 == 3
+                and "连续" not in mid_log
+                and "连续 3 轮判定为在跑" in end_log
+                and "探测过宽" in end_log and "请检查" in end_log):
+            ok_("连续轮次告警：连续 3 轮判定在跑才打告警（前 2 轮静默），告警写明两种可能")
+        else:
+            bad_(f"连续轮次告警异常：n={n1},{n2},{n3} mid={mid_log!r} end={end_log!r}")
+        n0 = record_updater_verdict(False, "自测：更新器未在跑")
+        n_again = record_updater_verdict(True, "自测：命中更新器路径")
+        if n0 == 0 and n_again == 1:
+            ok_("连续计数：判定「不在跑」即清零（再次在跑从 1 重新计）")
+        else:
+            bad_(f"连续计数清零异常：n0={n0} n_again={n_again}")
+        updater_streak_reset()
+        swap("LOG", stub_log)
 
         # 3a) 更新器不死等：永远在跑 -> 静默期 180s 封顶后中止，不动 asar
         swap("zcode_alive", lambda: False)

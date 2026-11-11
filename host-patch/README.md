@@ -22,9 +22,9 @@
 | `readaloud-loader.cjs` | **主进程**：解析 python → 起 127.0.0.1 临时端口 HTTP 桥（`/health` `/voices` `/tts` 流式）→ 只向 URL 含 `app.asar/out/renderer` 的窗口注入渲染脚本；失败只记日志 |
 | `readaloud-renderer.js` | **渲染层**：定位操作栏 → clone 复制按钮 → 喇叭图标 + `aria-label="朗读"` → 🔊 后插倍速按钮（循环 `1.0×/1.25×/1.5×/2.0×/0.75×`，存 localStorage）→ 点击取活节点 `innerText` → 按句切块流式 `<audio>` 播放 → 再点停止 → 不可用时降级 `speechSynthesis` → `MutationObserver` 兜底重注入 |
 | `patch-readaloud.py` | **asar 补丁器**：`selftest` / `install` / `remove` / `check` |
-| `readaloud-keys-watcher.py` | **watcher v3（常驻）**：等 ZCode 完全退出 → 等自动更新器静默（按 `ExecutablePath` 判定 electron-updater 产物，非 Squirrel） → 清残留 install_monitor → 装 zusage 状态条 + 朗读键双补丁 → **仅 `app.asar` sha256 变化才重启**（重启前复检客户端，避免双开）；`selftest` 子命令离线自检决策链；5s 轮询；7 天超时退出，由计划任务重新武装 |
+| `readaloud-keys-watcher.py` | **watcher v3（常驻）**：等 ZCode 完全退出 → 等自动更新器静默（按 `ExecutablePath` 判定；读不到路径的进程一律不判为更新器；Squirrel provider 另认 `%LOCALAPPDATA%` 布局） → 清残留 install_monitor → 装 zusage 状态条 + 朗读键双补丁 → **仅 `app.asar` sha256 变化才重启**（重启前复检客户端，避免双开）；`selftest` 子命令离线自检决策链；5s 轮询；7 天超时退出，由计划任务重新武装 |
 | `arm-watcher.ps1` | 武装脚本（幂等）：`readaloud-keys-watcher.py` 已在跑则跳过，否则隐藏窗口启动它；python 解释器分级探测（默认安装位 → `Get-Command python/python3` → 报错退出非 0）；计划任务 `ZCode-ReadAloudWatcher`（登录时 + 每小时）的入口 |
-| `register-task.ps1` | 计划任务注册脚本（幂等）：注册/更新 `ZCode-ReadAloudWatcher`（AtLogOn 当前用户 + 每小时重复；动作 = pwsh 全路径跑 `arm-watcher.ps1`；主体 = 当前用户 Interactive，不用 S4U/密码；`MultipleInstances=IgnoreNew`）。**任务丢了就重跑它** |
+| `register-task.ps1` | 计划任务注册脚本（幂等）：注册/更新 `ZCode-ReadAloudWatcher`（AtLogOn 当前用户 + 每小时重复；动作 = pwsh 全路径跑 `arm-watcher.ps1`；主体 = 当前用户 Interactive，不用 S4U/密码；`MultipleInstances=IgnoreNew`；`ExecutionTimeLimit=0` 是**防御性设置**——arm 脚本用 `Start-Process`（无 `-Wait`）启动 watcher 后立刻退出，任务本体从不拥有 watcher 进程，当前实现下 `PT1H` 与 `PT0S` 无实际差别；将来若 arm 改成前台跑 watcher，`PT1H` 才会砍掉常驻进程）。**任务丢了就重跑它** |
 | `install.ps1` / `uninstall.ps1` | PS7 runbook（全路径 `C:\Program Files\PowerShell\7\pwsh.exe`，自动用 PS7 重跑自己） |
 | `state/entry-pristine.json` | 安装前入口指纹（按 asar 路径记录；`remove` 时用来断言字节回到原样；可删） |
 
@@ -186,11 +186,27 @@ ZCode 3.18.0 的 `resources/app-update.yml` 是 `provider: generic` —— 走 *
   （目录名取自 `D:\ZCode\resources\app-update.yml` 的 `updaterCacheDirName: "@zcodedesktop-updater"`，
   读不到就用内置默认名，宿主改 appId 也不会失效）；
 - 可执行路径在 ZCode 安装目录（由 asar 路径反推）且进程名属于
-  `{Update.exe, elevate.exe, installer.exe, ZCode-*-win-x64.exe}` -> 判为更新器在跑；
+  `{Update.exe, elevate.exe, installer.exe, ZCode-*-win-x64.exe}` -> 判为更新器在跑
+  （`installer.exe` 名字通用，所以**只在路径确实位于更新器缓存目录或 ZCode 安装目录时**才认）；
+- `provider` 字段含 `squirrel` 时（历史布局）：可执行路径在 `%LOCALAPPDATA%` 下且进程名属于
+  `{Update.exe, elevate.exe}` -> 判为更新器在跑。Squirrel 的产物在
+  `%LOCALAPPDATA%\<appId>\app-<ver>\Update.exe`，既不在更新器缓存目录、也不在 ZCode 安装目录，
+  只按上面两条会漏判。**非 squirrel provider 下这条规则不生效**（当前行为不变）；
+- **读不到 `ExecutablePath` 的进程（SYSTEM / 受保护进程，本机 24 个）一律不判为更新器**：
+  这类进程只计数上报（`NOPATH=<n>`，写进日志）。旧口径在这里按进程名兜底，而名单里
+  `installer.exe` 是个通用名 —— 机器上只要有一个 SYSTEM 级同名进程，每轮都会判「更新器在跑」，
+  等 180s 后 `abort-updater`，**自愈永久静默失效且只留一行日志**。真实更新器进程位于用户可读的
+  更新器缓存目录，`ExecutablePath` 本就读得到；
 - 其余进程一律不管：旧的 `tasklist` 全表子串匹配 `"update.exe"` **既盯不到真更新器**
   （真更新器叫 `installer.exe`），**又会被 `GoogleUpdate.exe` / `DropboxUpdate.exe` 之类误命中**，
   白白中止 180s；
 - 查不到 / 出错 -> 保守按「更新器在跑」处理（宁可不装，也不与安装器并发改 `app.asar`）。
+
+> **连续在跑会告警（不静默卡死）**：上面最后一条 fail-closed（查不到/出错按「在跑」）的失败模式
+> 是「永久静默」——若探测持续异常（探测过宽、CIM 挂了），自愈会无声地一直不生效，而每轮只留一行
+> 日志。watcher 因此记着「连续判定为在跑」的轮数，**连续 3 轮**就追加一条告警：
+> 「更新器探测连续 N 轮判定为在跑：可能是更新器真的在跑，也可能是探测过宽/CIM 异常导致自愈静默，
+> 请检查」——两种可能都写上，不替你下结论；某轮判定为「不在跑」即清零。
 
 ### 轮询 5s
 

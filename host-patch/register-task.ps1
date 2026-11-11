@@ -10,9 +10,12 @@
 #   主体    ：当前用户 + Interactive 登录类型。**不用 S4U、不存密码**：
 #              S4U 会把任务丢进 Session 0（GUI 程序起不来、也拿不到用户会话）
 #   设置    ：MultipleInstances=IgnoreNew（不叠开第二个实例）
-#             ExecutionTimeLimit=0（不限时）——watcher 自己管 7 天生命周期；
-#             若设成 1 小时，任务每小时砍掉 watcher，而 watcher 重启时又会执行
-#             「开机 ZCode 没跑就直接装补丁」那一轮：用户明明关了客户端却被反复拉起
+#             ExecutionTimeLimit=0（不限时）——**防御性设置**。
+#             arm-watcher.ps1 用 Start-Process（无 -Wait）启动 watcher 后立刻退出，
+#             任务本体只活约 1 秒，从不拥有 watcher 进程，所以当前实现下
+#             PT1H 与 PT0S 没有实际差别；
+#             若将来 arm 脚本改成前台运行 watcher，PT1H 会在 1 小时后杀掉常驻进程，
+#             那时 PT0S 才是必需的（watcher 自己管 7 天生命周期）。
 #
 # 幂等：已存在则更新同名任务（触发器/动作/主体/设置），并打印当前状态；重复跑不报错。
 
