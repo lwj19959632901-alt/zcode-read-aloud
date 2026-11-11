@@ -22,6 +22,8 @@
 | `readaloud-loader.cjs` | **主进程**：解析 python → 起 127.0.0.1 临时端口 HTTP 桥（`/health` `/voices` `/tts` 流式）→ 只向 URL 含 `app.asar/out/renderer` 的窗口注入渲染脚本；失败只记日志 |
 | `readaloud-renderer.js` | **渲染层**：定位操作栏 → clone 复制按钮 → 喇叭图标 + `aria-label="朗读"` → 🔊 后插倍速按钮（循环 `1.0×/1.25×/1.5×/2.0×/0.75×`，存 localStorage）→ 点击取活节点 `innerText` → 按句切块流式 `<audio>` 播放 → 再点停止 → 不可用时降级 `speechSynthesis` → `MutationObserver` 兜底重注入 |
 | `patch-readaloud.py` | **asar 补丁器**：`selftest` / `install` / `remove` / `check` |
+| `readaloud-keys-watcher.py` | **watcher v3（常驻）**：等 ZCode 完全退出 → 等 Update.exe/elevate.exe 静默 → 清残留 install_monitor → 装 zusage 状态条 + 朗读键双补丁 → **仅 `app.asar` sha256 变化才重启**；`selftest` 子命令离线自检决策链；7 天超时退出，由计划任务重新武装 |
+| `arm-watcher.ps1` | 武装脚本（幂等）：`readaloud-keys-watcher.py` 已在跑则跳过，否则隐藏窗口启动它；计划任务 `ZCode-ReadAloudWatcher`（登录时 + 每小时）的入口 |
 | `install.ps1` / `uninstall.ps1` | PS7 runbook（全路径 `C:\Program Files\PowerShell\7\pwsh.exe`，自动用 PS7 重跑自己） |
 | `state/entry-pristine.json` | 安装前入口指纹（按 asar 路径记录；`remove` 时用来断言字节回到原样；可删） |
 
@@ -157,9 +159,32 @@ zusage 每 60 秒会自动重装自己的注入行，会把我们的行挤到**�
 - 播放态高亮**不读** `--color-primary`（当前主题实算为 `#fff`，改字色等于没提示）：固定用
   accent `#4f9cf9` 的背景 tint + 内描边，并同步 `aria-pressed="true"` 给读屏。
 
-## 升级 ZCode 之后
+## 升级 ZCode 之后（自动自愈链）
 
-官方升级会整包替换 `app.asar` → 注入行消失，按钮也随之不见。**升级后重跑 `install.ps1` 即可**。
+官方升级（Squirrel 整包替换 `app.asar`）会同时抹掉 zusage 状态条与朗读键两条注入行。
+自愈由常驻 watcher v3 完成，一般**无需手动重跑 `install.ps1`**：
+
+```
+计划任务 ZCode-ReadAloudWatcher（登录时 + 每小时）
+  -> arm-watcher.ps1（幂等武装：watcher 已在跑则跳过）
+  -> readaloud-keys-watcher.py v3 常驻（tasklist 2s 轮询等 ZCode 完全退出）
+  -> 退出后：等 Update.exe/elevate.exe 静默 -> 清残留 install_monitor
+     -> 装 zusage 状态条 -> 装/校验朗读键 -> 对比 app.asar sha256
+  -> 仅当 sha 真的变化才重启 ZCode（无变更不打扰）；7 天超时退出，由任务重新武装
+```
+
+设计行为：**开机/武装时若 ZCode 本来就没在跑**，v3 会直接装补丁，sha 有变化就顺手拉起 ZCode。
+
+手动兜底（计划任务丢失 / 想立即武装 / 想离线验证决策链）：
+
+```powershell
+# 武装（幂等，重复跑安全）：
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -WindowStyle Hidden -File .\arm-watcher.ps1
+# 或直接前台跑 watcher / 离线自检决策链：
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" .\readaloud-keys-watcher.py
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" .\readaloud-keys-watcher.py selftest
+```
+
 `state/entry-pristine.json` 记的是上一版的入口指纹（按 asar 路径分键），`remove` 时对不上会提示「asar 已被官方升级，属正常」，
 不影响剥离。
 
