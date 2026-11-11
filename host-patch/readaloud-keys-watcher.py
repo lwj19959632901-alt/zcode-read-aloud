@@ -20,6 +20,7 @@
   python readaloud-keys-watcher.py            # 常驻主循环
   python readaloud-keys-watcher.py selftest   # 离线决策链自检（不碰真实 asar、不杀真进程、不真重启）
 """
+import errno
 import hashlib
 import json
 import os
@@ -39,6 +40,18 @@ ZCODE_EXE = Path(r"D:\ZCode\ZCode.exe")
 PWSH = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")  # pwsh 一律全路径（禁短名/WindowsApps 桩）
 DEADLINE_DAYS = 7
 POLL_SECS = 2
+
+# 单实例独占锁文件。选 ~/.zcode/ 而不是脚本同目录（HERE）有三个理由：
+#   1) host-patch/ 是 git 仓库目录，丢一个 .lock 在那儿会让 `git status` 常驻一条
+#      未跟踪噪声（而仓库只该有那一个被改的源码文件）；
+#   2) ~/.zcode/ 已经是本 watcher 的运行态目录（日志就写在那儿），运行态归一处；
+#      （注：~/.zcode 是指向 D:\ZCodeData\app-data 的 junction，锁文件实体即
+#      D:\ZCodeData\app-data\readaloud-keys-watcher.lock，与日志同目录）
+#   3) 路径与「从哪份脚本启动」无关 —— README 的手动兜底路径和计划任务路径指向同一把
+#      锁，跨副本也只有一个实例能跑。
+LOCK = HOME / ".zcode" / "readaloud-keys-watcher.lock"
+
+_LOCK_FD = None   # 持锁的裸 fd（int，不会被 GC 关闭；main() 局部变量亦持有同一引用）
 
 
 def _resolve_py() -> Path:
@@ -60,6 +73,59 @@ def log(msg: str) -> None:
             f.write(line + "\n")
     except OSError:
         pass
+
+
+def acquire_lock(path: Path | None = None):
+    """跨进程独占锁（单实例守卫）。返回 (fd, reason)：拿到锁时 (fd, "")，拿不到时 (None, 中文原因)。
+
+    语义要点：
+      - OS 级锁：进程退出/被杀时由 OS 自动释放 —— 不留死锁，崩了下次照常拿锁；
+      - 非阻塞：锁被占时立刻失败（第二个实例必须马上退出，不能等超时）；
+      - Windows 用 msvcrt.locking(LK_NBLCK) 锁 1 字节，POSIX 用 fcntl.flock(LOCK_EX|LOCK_NB)。
+      写法与同机 zusage 插件 runtime_lock.py 的 file_lock() 同款（那边是带超时重试的变体，
+      这里要求「拿不到立刻退出」，故不重试）。
+    fd 是裸 int，Python 不会替我们关闭它；调用方必须持有到进程结束（见 main()）。
+    """
+    target = LOCK if path is None else Path(path)
+    try:
+        fd = os.open(os.fspath(target), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        return None, f"独占锁不可用（打不开锁文件 {target}：{e}）"
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+            return None, "已有 watcher 在跑（独占锁被占用）"
+        return None, f"独占锁不可用（加锁失败：{e}）"
+    return fd, ""
+
+
+def release_lock(fd: int) -> None:
+    """释放独占锁并关 fd（正常退出路径用；进程被杀时 OS 会自动回收）。"""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def zcode_alive() -> bool:
@@ -244,34 +310,48 @@ def one_round() -> str:
 
 
 def main() -> None:
-    log("=== watcher v3 启动（常驻：等退出装双补丁，仅 sha 变化才重启；7 天超时）===")
-    if not PATCH.is_file():
-        log(f"patch-readaloud.py 不存在：{PATCH} —— watcher 退出（检查仓库位置）")
+    global _LOCK_FD
+    # 单实例守卫：先抢跨进程独占锁。锁由 OS 随进程退出自动释放（崩了/被杀都不留
+    # 死锁，下次启动照常拿锁）；锁被占说明已有 watcher 在跑（计划任务与 README 手动
+    # 兜底各起了一份），必须立刻退出——两个 watcher 并发会对同一个 app.asar 同时
+    # repack（竞态，可能产出半截包）并各重启一次 ZCode（双开）。
+    lock_fd, lock_reason = acquire_lock()
+    if lock_fd is None:
+        log(f"{lock_reason}，本次退出，避免并发改 asar")
         return
-    deadline = datetime.now() + timedelta(days=DEADLINE_DAYS)
-    # 启动即视为「已见过 ZCode 在跑」：开机 ZCode 未跑也直接处理一轮（设计行为，
-    # 见 README「升级 ZCode 之后」）。本轮结束后必须再见到 ZCode 在跑，才会处理
-    # 它的下一次退出——否则 ZCode 一直关着时会空转反复装。
-    seen_alive = True
-    while True:
-        if datetime.now() > deadline:
-            log(f"{DEADLINE_DAYS} 天超时——watcher 退出（计划任务 ZCode-ReadAloudWatcher 会重新武装）")
+    _LOCK_FD = lock_fd                    # 全局持有引用，确保 fd 活到进程结束
+    try:
+        log("=== watcher v3 启动（常驻：等退出装双补丁，仅 sha 变化才重启；7 天超时）===")
+        if not PATCH.is_file():
+            log(f"patch-readaloud.py 不存在：{PATCH} —— watcher 退出（检查仓库位置）")
             return
-        if zcode_alive():
-            seen_alive = True
-            time.sleep(POLL_SECS)
-            continue
-        if not seen_alive:
-            time.sleep(POLL_SECS)
-            continue
-        log("ZCode 已完全退出（tasklist 2s 轮询捕获）")
-        try:
-            action = one_round()
-        except Exception as e:                     # 常驻兜底：单轮异常不倒整个 watcher
-            action = f"abort-exception:{type(e).__name__}"
-            log(f"本轮异常（已吞掉，回等待）：{e}")
-        seen_alive = False
-        log(f"本轮结束（{action}），回等待下一次 ZCode 退出")
+        deadline = datetime.now() + timedelta(days=DEADLINE_DAYS)
+        # 启动即视为「已见过 ZCode 在跑」：开机 ZCode 未跑也直接处理一轮（设计行为，
+        # 见 README「升级 ZCode 之后」）。本轮结束后必须再见到 ZCode 在跑，才会处理
+        # 它的下一次退出——否则 ZCode 一直关着时会空转反复装。
+        seen_alive = True
+        while True:
+            if datetime.now() > deadline:
+                log(f"{DEADLINE_DAYS} 天超时——watcher 退出（计划任务 ZCode-ReadAloudWatcher 会重新武装）")
+                return
+            if zcode_alive():
+                seen_alive = True
+                time.sleep(POLL_SECS)
+                continue
+            if not seen_alive:
+                time.sleep(POLL_SECS)
+                continue
+            log("ZCode 已完全退出（tasklist 2s 轮询捕获）")
+            try:
+                action = one_round()
+            except Exception as e:                     # 常驻兜底：单轮异常不倒整个 watcher
+                action = f"abort-exception:{type(e).__name__}"
+                log(f"本轮异常（已吞掉，回等待）：{e}")
+            seen_alive = False
+            log(f"本轮结束（{action}），回等待下一次 ZCode 退出")
+    finally:
+        release_lock(lock_fd)
+        _LOCK_FD = None
 
 
 # ---------------------------------------------------------------- selftest
@@ -327,6 +407,9 @@ def cmd_selftest() -> int:
     try:
         swap("LOG", stub_log)
         swap("ASAR", stub_asar)
+        # 单实例锁也换成临时文件：selftest 内部会调 main()，不能跟真 watcher 抢锁
+        # （真 watcher 持锁时 main() 会立刻返回，导致主循环断言误判）。
+        swap("LOCK", tmpdir / "selftest-watch.lock")
 
         # 3a) 更新器不死等：永远在跑 -> 静默期 180s 封顶后中止，不动 asar
         swap("zcode_alive", lambda: False)
@@ -444,6 +527,70 @@ def cmd_selftest() -> int:
             tmpdir.rmdir()
         except OSError:
             print(f"  ..    临时目录未清理干净：{tmpdir}")
+
+    # --- 4) 单实例独占锁：同进程内两个不同 fd 抢同一把锁 -> 第二个必须立刻失败
+    #     （本机实测：Windows msvcrt.locking 对同一区域重复锁定抛 PermissionError
+    #      errno 13(EACCES)；POSIX fcntl.flock 同进程第二个 fd 拿 EX 锁也会 EAGAIN）
+    lock_dir = Path(tempfile.mkdtemp(prefix="readaloud-watcher-lock-"))
+    try:
+        same_path = lock_dir / "same-proc.lock"
+        fd_a, why_a = acquire_lock(same_path)
+        fd_b, why_b = acquire_lock(same_path)
+        if fd_a is not None and fd_b is None and "独占锁被占用" in why_b:
+            ok_(f"独占锁：同进程第二个 fd 抢锁立刻失败（{why_b}）")
+        else:
+            bad_(f"独占锁同进程抢锁异常：fd_a={fd_a} why_a={why_a} fd_b={fd_b} why_b={why_b}")
+        if fd_a is not None:
+            release_lock(fd_a)
+
+        # --- 5) 持锁进程退出后锁可再次获得（OS 随进程退出释放，不留死锁残留）
+        #     用真子进程验证：子进程持锁期间父进程拿不到锁；子进程退出后父进程能拿到。
+        child_lock = lock_dir / "child.lock"
+        ready = lock_dir / "child.ready"
+        child_code = "\n".join([
+            "import importlib.util, sys",
+            "spec = importlib.util.spec_from_file_location('rw_lockchild', sys.argv[1])",
+            "mod = importlib.util.module_from_spec(spec)",
+            "spec.loader.exec_module(mod)",
+            "fd, why = mod.acquire_lock(mod.Path(sys.argv[2]))",
+            "open(sys.argv[3], 'w', encoding='utf-8').write('OK' if fd is not None else 'FAIL:' + why)",
+            "sys.stdin.read()",
+        ])
+        child = subprocess.Popen([sys.executable, "-c", child_code, str(Path(__file__).resolve()),
+                                  str(child_lock), str(ready)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 30
+        while not ready.is_file() and time.monotonic() < deadline:
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        ready_text = ready.read_text(encoding="utf-8").strip() if ready.is_file() else ""
+        fd_p, why_p = acquire_lock(child_lock)
+        blocked_ok = fd_p is None and "独占锁被占用" in why_p
+        if fd_p is not None:
+            release_lock(fd_p)
+        if child.stdin:
+            child.stdin.close()
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            child.kill()
+        fd_q, why_q = acquire_lock(child_lock)
+        if fd_q is not None:
+            release_lock(fd_q)
+        if (ready_text == "OK" and blocked_ok and fd_q is not None):
+            ok_(f"独占锁：子进程持锁时父进程拿不到（{why_p}）；子进程退出后可再获得（无死锁残留）")
+        else:
+            bad_(f"独占锁跨进程异常：child={ready_text} blocked={blocked_ok}/{why_p} "
+                 f"reacquire={fd_q is not None}/{why_q}")
+    finally:
+        try:
+            for f in lock_dir.iterdir():
+                f.unlink(missing_ok=True)
+            lock_dir.rmdir()
+        except OSError:
+            print(f"  ..    锁测试临时目录未清理干净：{lock_dir}")
 
     print()
     if failures == 0:
