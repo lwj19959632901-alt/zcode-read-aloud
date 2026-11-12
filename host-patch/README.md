@@ -22,7 +22,7 @@
 | `readaloud-loader.cjs` | **主进程**：解析 python → 起 127.0.0.1 临时端口 HTTP 桥（`/health` `/voices` `/tts` 流式）→ 只向 URL 含 `app.asar/out/renderer` 的窗口注入渲染脚本；失败只记日志 |
 | `readaloud-renderer.js` | **渲染层**：定位操作栏 → clone 复制按钮 → 喇叭图标 + `aria-label="朗读"` → 🔊 后插倍速按钮（循环 `1.0×/1.25×/1.5×/2.0×/0.75×`，存 localStorage）→ 点击取活节点 `innerText` → 按句切块流式 `<audio>` 播放 → 再点停止 → 不可用时降级 `speechSynthesis` → `MutationObserver` 兜底重注入 |
 | `patch-readaloud.py` | **asar 补丁器**：`selftest` / `install` / `remove` / `check` |
-| `readaloud-keys-watcher.py` | **watcher v3（常驻）**：等 ZCode 完全退出 → 等自动更新器静默（按 `ExecutablePath` 判定；读不到路径的进程一律不判为更新器；Squirrel provider 另认 `%LOCALAPPDATA%` 布局） → 清残留 install_monitor → 装 zusage 状态条 + 朗读键双补丁 → **仅 `app.asar` sha256 变化才重启**（重启前复检客户端，避免双开）；`selftest` 子命令离线自检决策链；5s 轮询；7 天超时退出，由计划任务重新武装 |
+| `readaloud-keys-watcher.py` | **watcher v3（常驻）**：等 ZCode 完全退出 → 等自动更新器静默（按 `ExecutablePath` 判定；读不到路径的进程一律不判为更新器；Squirrel provider 另认 `%LOCALAPPDATA%` 布局） → 清残留 `install_monitor` → 装朗读键（消息操作栏按钮） → 校验朗读键注入行（check） → 装 zusage 状态条补丁 → **仅 `app.asar` sha256 变化才重启**（重启前复检客户端，避免双开）；`selftest` 子命令离线自检决策链；5s 轮询；7 天超时退出，由计划任务重新武装 |
 | `arm-watcher.ps1` | 武装脚本（幂等）：`readaloud-keys-watcher.py` 已在跑则跳过，否则隐藏窗口启动它；python 解释器分级探测（默认安装位 → `Get-Command python/python3` → 报错退出非 0）；计划任务 `ZCode-ReadAloudWatcher`（登录时 + 每小时）的入口 |
 | `register-task.ps1` | 计划任务注册脚本（幂等）：注册/更新 `ZCode-ReadAloudWatcher`（AtLogOn 当前用户 + 每小时重复；动作 = pwsh 全路径跑 `arm-watcher.ps1`；主体 = 当前用户 Interactive，不用 S4U/密码；`MultipleInstances=IgnoreNew`；`ExecutionTimeLimit=0` 是**防御性设置**——arm 脚本用 `Start-Process`（无 `-Wait`）启动 watcher 后立刻退出，任务本体从不拥有 watcher 进程，当前实现下 `PT1H` 与 `PT0S` 无实际差别；将来若 arm 改成前台跑 watcher，`PT1H` 才会砍掉常驻进程）。**任务丢了就重跑它** |
 | `install.ps1` / `uninstall.ps1` | PS7 runbook（全路径 `C:\Program Files\PowerShell\7\pwsh.exe`，自动用 PS7 重跑自己） |
@@ -84,7 +84,8 @@ ZCode 的自动更新走 `resources/app-update.yml` 里的 generic feed。若安
 
 ### 3. 幂等靠正则，不靠「是否在尾部」
 
-zusage 每 60 秒会自动重装自己的注入行，会把我们的行挤到**非尾部**。
+zusage 会自动重装自己的注入行（`hooks.json` 的 SessionStart 在每个会话启动时检测未注入即修复），
+会把我们的行挤到**非尾部**。
 按「尾部是不是我的行」判断会重复追加；本工具用唯一 token `readaloud-loader.cjs` 的正则
 `re.sub` 清理所有历史行再追加一条，装完断言**恰好 1 处**。
 
@@ -170,10 +171,21 @@ zusage 每 60 秒会自动重装自己的注入行，会把我们的行挤到**�
   -> arm-watcher.ps1（幂等武装：watcher 已在跑则跳过）
   -> readaloud-keys-watcher.py v3 常驻（tasklist 5s 轮询等 ZCode 完全退出）
   -> 退出后：等自动更新器静默（按可执行文件路径判定）-> 清残留 install_monitor
-     -> 装 zusage 状态条（带 ZUSAGE_MONITOR_QUIET=1，自愈时不弹黑窗）
-     -> 装/校验朗读键 -> 对比 app.asar sha256
+     -> 装朗读键（消息操作栏按钮；先落地：它不自愈）
+     -> 校验朗读键注入行（check；非零只记日志，重启与否只看 sha）
+     -> 装 zusage 状态条补丁（带 ZUSAGE_MONITOR_QUIET=1，自愈时不弹黑窗）
+     -> 对比 app.asar sha256
   -> 仅当 sha 真的变化才重启 ZCode（无变更不打扰）；7 天超时退出，由任务重新武装
 ```
+
+> **顺序不能反（2026-11-13 01:08 事故）**：那轮 zusage 状态条先占了 8 秒，轮到朗读键时用户
+> 已重新拉起 ZCode -> `install` 退出码 2，本轮整轮作废。zusage 自带自愈通道（`hooks.json` 的
+> SessionStart 在每个会话启动时检测未注入即修复，`patch_install.py` 拉起的 `install_monitor`
+> 每 10 秒检测一次）、朗读键不会自愈，所以朗读键必须排最前。朗读键失败时状态条 install 直接
+> 跳过，两个分支理由不同：**exit 2** = 客户端已在跑，那 8 秒是白等且必然失败；**非 0/2** =
+> 安装本身失败（装完校验失败、权限、磁盘……），asar 状态未定，不再叠第二次 repack。
+> `selftest` 里有下标顺序断言，以及 exit 2 / exit 1 两条「状态条 install 一次都没跑」断言
+> 守住这一点。
 
 ### 静默期怎么判「更新器在跑」（按路径，不按进程名）
 

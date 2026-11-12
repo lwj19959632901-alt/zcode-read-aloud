@@ -3,9 +3,9 @@
 """readaloud + statusbar 双补丁 watcher（v3，常驻版）
 
 常驻等 ZCode 完全退出 -> 等自动更新器静默（换包期间不动 asar）
--> 清残留 install_monitor（防 asar 竞态）-> 装 zusage 状态条补丁 -> 装 readaloud 消息栏
-按键补丁 -> check -> 对比 app.asar sha256：变化才重启 ZCode，无变化不重启；本轮结束后
-回等待下一次退出（7 天超时退出，由计划任务 ZCode-ReadAloudWatcher 重新武装）。
+-> 清残留 install_monitor（防 asar 竞态）-> 装朗读键补丁 -> 校验朗读键注入行（check）
+-> 装 zusage 状态条补丁 -> 对比 app.asar sha256：变化才重启 ZCode，无变化不重启；
+本轮结束后回等待下一次退出（7 天超时退出，由计划任务 ZCode-ReadAloudWatcher 重新武装）。
 
 对 v2 三个缺陷的修复：
   1. wmic 在 Win11 26300 已不存在（清 monitor 永远失败，日志 WinError 2 实证）
@@ -40,6 +40,12 @@ v3 复审 P2 修复（2026-11-11）：
   - ExecutionTimeLimit 因果注释修正（P2-1）：register-task.ps1 里「每小时任务会砍掉 watcher」
     的说法不成立（arm 脚本 Start-Process 无 -Wait，任务本体只活约 1 秒，从不拥有 watcher
     进程），改成防御性表述。
+
+v3 抢跑修复（2026-11-13）：朗读键 install 提到状态条 install **之前**。
+  01:08 那轮 zusage 状态条先占 8 秒，轮到朗读键时用户已重新拉起 ZCode -> exit 2，
+  本轮作废。zusage 自带自愈通道（hooks.json 的 SessionStart 每个会话启动时检测未注入即修复，
+  install_monitor 每 10 秒检测一次）、朗读键不会自愈，所以朗读键必须排最前；
+  朗读键 exit 2 / 非 0/2 时状态条 install 直接跳过（客户端已在跑，白等且必然失败）。
 
 用法：
   python readaloud-keys-watcher.py            # 常驻主循环
@@ -578,33 +584,42 @@ def one_round() -> str:
     if not kill_install_monitors():
         log("install monitor 未清净，本轮中止（不动 asar）")
         return "abort-monitor"
-    # zusage 状态条安装器：动态解析（插件升级会换版本目录，v2 硬编码 1.5.3 已失效）
+    # zusage 状态条安装器：动态解析（插件升级会换版本目录，v2 硬编码 1.5.3 已失效）。
+    # 这里只解析路径，真正 install 放到朗读键之后执行（见下方顺序注释）。
     overlay = resolve_overlay_install()
     try:
         asar_before = sha256_file(ASAR)
     except OSError as e:
         log(f"装前读 asar 指纹失败，本轮中止（不动 asar）：{e}")
         return "abort-asar-read"
+    # 顺序（2026-11-13 01:08 抢跑事故）：朗读键 install 必须排在状态条 install **之前**。
+    # 那轮状态条先跑 8 秒，轮到朗读键时用户已重新拉起 ZCode -> exit 2，本轮作废；
+    # zusage 自带自愈通道（SessionStart + install_monitor 每 10 秒检测）、朗读键不会自愈，
+    # 所以朗读键先落地。asar_before 仍必须在任何 install 之前。
+    r1 = run("朗读键", PATCH, "install")
+    if r1 == 2:
+        # exit 2 = 客户端又在跑（安装器自己的输出已自证），本轮结束回等待；
+        # 状态条 install 也一并跳过 —— 客户端已在跑，那 8 秒是白等且必然失败。
+        log("安装时客户端又在运行（exit 2），本轮结束（跳过状态条 install）")
+        return "abort-client-running"
+    if r1 not in (0, 2):
+        # P2-7：非 0/2 = 安装本身失败（装完校验失败、权限、磁盘……）。这种状态绝不能
+        # 继续走 sha 对比与重启：asar 可能处于半截状态，重启等于把坏包送给用户。
+        # 状态条 install 同样跳过：asar 状态未定，不再叠第二次 repack。
+        log(f"安装未成功（exit={r1}），本轮中止（不重启、不动 asar、跳过状态条 install）")
+        return "abort-install-failed"
+    run("朗读键check", PATCH, "check")             # 非零只记日志：重启与否只看 sha 对比
+    # 状态条押后（失败只记日志、不中止，v2 语义；zusage 自带自愈通道）：
+    # 即使这里被复活的客户端打断，本轮朗读键也已落地，不会整轮作废。
     if overlay is not None:
         # P2-5：zusage 的 launch_monitor 在 Windows 走 CREATE_NEW_CONSOLE —— 自愈时会在
         # 桌面弹一个黑窗。ZUSAGE_MONITOR_QUIET=1 是 zusage 自带的静默开关（已实测：
         # patch_install.py:294 / overlay_install.py:994 都认它，走 WMI 脱离式 pythonw
         # 或 CREATE_NO_WINDOW，无窗口）。只给状态条 install 这一步加，不影响别的步骤。
         run("状态条", overlay, "install", env={"ZUSAGE_MONITOR_QUIET": "1"})
-        # 非零退出：记日志，继续装朗读键（v2 语义）
+        # 非零退出：记日志，不中止（v2 语义；zusage 自带自愈通道）
     else:
-        log("跳过状态条（zusage 插件路径解析失败），继续装朗读键")
-    r1 = run("朗读键", PATCH, "install")
-    if r1 == 2:
-        # exit 2 = 客户端又在跑（安装器自己的输出已自证），本轮结束回等待
-        log("安装时客户端又在运行（exit 2），本轮结束")
-        return "abort-client-running"
-    if r1 not in (0, 2):
-        # P2-7：非 0/2 = 安装本身失败（装完校验失败、权限、磁盘……）。这种状态绝不能
-        # 继续走 sha 对比与重启：asar 可能处于半截状态，重启等于把坏包送给用户。
-        log(f"安装未成功（exit={r1}），本轮中止（不重启、不动 asar）")
-        return "abort-install-failed"
-    run("朗读键check", PATCH, "check")             # 非零只记日志：重启与否只看 sha 对比
+        log("跳过状态条（zusage 插件路径解析失败），朗读键已装")
     try:
         asar_after = sha256_file(ASAR)
     except OSError as e:
@@ -756,11 +771,15 @@ def cmd_selftest() -> int:
         bad_(f"Squirrel 名字集合异常：{sq_line!r}")
 
     # --- 2) 动态解析 zusage 插件路径（读真实 installed_plugins.json）
+    #     断言不锁版本号：插件自己会升（1.5.16 -> 1.5.18 时这里锁死成 FAIL，与代码无关），
+    #     只要求解析到的路径位于 zcode-token-usage-statusbar 目录且 overlay_install.py 真实存在。
     overlay = resolve_overlay_install()
-    if overlay is not None and "1.5.16" in str(overlay) and overlay.is_file():
+    if (overlay is not None and overlay.is_file()
+            and "zcode-token-usage-statusbar" in str(overlay)
+            and overlay.name == "overlay_install.py"):
         ok_(f"overlay_install.py 动态解析成功：{overlay}")
     else:
-        bad_(f"overlay 解析失败或路径不含 1.5.16：{overlay}")
+        bad_(f"overlay 解析失败（期望 zusage 插件目录下的 overlay_install.py）：{overlay}")
 
     # --- 3) 决策链打桩（tempfile 临时目录 + monkeypatch，跑完整一轮）
     tmpdir = Path(tempfile.mkdtemp(prefix="readaloud-watcher-selftest-"))
@@ -900,6 +919,20 @@ def cmd_selftest() -> int:
         else:
             bad_(f"状态条 env 异常：bar={bar_env} others={other_env}")
 
+        # 3d-3) 顺序断言（2026-11-13 01:08 抢跑事故）：朗读键 install 必须排在状态条 install
+        #       之前。那轮状态条先占 8 秒，轮到朗读键时用户已重新拉起 ZCode -> exit 2，
+        #       本轮整轮作废（zusage 自带自愈通道，朗读键不会自愈）。
+        idx_keys = next((i for i, (lb, a) in enumerate(run_calls)
+                         if lb == "朗读键" and a == "install"), None)
+        idx_bar = next((i for i, (lb, a) in enumerate(run_calls)
+                        if lb == "状态条" and a == "install"), None)
+        if idx_keys is not None and idx_bar is not None and idx_keys < idx_bar:
+            ok_(f"顺序：朗读键 install（第 {idx_keys} 次 run）排在状态条 install（第 {idx_bar} 次）之前"
+                "（防止客户端先起来把朗读键挡成 exit 2）")
+        else:
+            bad_(f"顺序异常：朗读键 install 下标={idx_keys}，状态条 install 下标={idx_bar}"
+                 "（必须朗读键在前，否则客户端复活即整轮作废）")
+
         # 3e) install exit 2（客户端又在跑）-> 本轮结束回等待：不跑 check、不动 asar、不重启
         def run_exit2(label, script, arg, env=None):
             run_calls.append((label, arg))
@@ -911,8 +944,10 @@ def cmd_selftest() -> int:
         action = one_round()
         if (action == "abort-client-running" and not restarted
                 and sha256_file(stub_asar) == sha0
-                and not any(arg == "check" for _, arg in run_calls)):
-            ok_("install exit 2：abort-client-running，不跑 check、不动 asar、不重启")
+                and not any(arg == "check" for _, arg in run_calls)
+                and not any(lb == "状态条" for lb, _ in run_calls)):
+            ok_("install exit 2：abort-client-running，不跑 check、不动 asar、不重启；"
+                "状态条 install 一次都没跑（客户端已在跑，白等且必然失败）")
         else:
             bad_(f"exit2 场景异常：action={action} run={run_calls} restart={len(restarted)}")
 
@@ -955,8 +990,10 @@ def cmd_selftest() -> int:
         action = one_round()
         if (action == "abort-install-failed" and not restarted
                 and sha256_file(stub_asar) == sha0
-                and not any(arg == "check" for _, arg in run_calls)):
-            ok_("install exit 1：abort-install-failed，不跑 check、不动 asar、不重启")
+                and not any(arg == "check" for _, arg in run_calls)
+                and not any(lb == "状态条" for lb, _ in run_calls)):
+            ok_("install exit 1：abort-install-failed，不跑 check、不动 asar、不重启；"
+                "状态条 install 一次都没跑（asar 状态未定，不再叠第二次 repack）")
         else:
             bad_(f"exit1 场景异常：action={action} run={run_calls} restart={len(restarted)}")
 
